@@ -1,6 +1,6 @@
 # local-ai-clients
 
-Client applications for [local-ai-server](../local-ai-server/). Voice transcription GUI, pronunciation drill, and headless test harness.
+Client applications for [local-ai-server](https://github.com/rmtew/local-ai-server). Voice transcription GUI, pronunciation drill, and headless test harness.
 
 ## Clients
 
@@ -39,7 +39,7 @@ Clients are thin: all AI inference runs on the server. Clients handle audio capt
 ## Prerequisites
 
 1. Visual Studio with C++ workload (MSVC compiler)
-2. [local-ai-server](../local-ai-server/) running for ASR
+2. [local-ai-server](https://github.com/rmtew/local-ai-server) running for ASR
 
 No external dependencies (DEPS_ROOT not required). TTS uses Windows SAPI.
 

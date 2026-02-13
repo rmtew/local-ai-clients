@@ -37,8 +37,8 @@ MSVC environment is auto-detected. No external dependencies required (DEPS_ROOT 
 
 ## Related Repositories
 
-- [local-ai-server](../local-ai-server/) -- ASR inference server (Qwen3-ASR)
-- [lifeapp](../lifeapp/) -- Original project (voice notes extracted from here)
+- [local-ai-server](https://github.com/rmtew/local-ai-server) -- ASR inference server (Qwen3-ASR)
+- [lifeapp](https://github.com/rmtew/lifeapp) -- Original project (voice notes extracted from here)
 
 ## Key Patterns
 
