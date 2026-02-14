@@ -6,7 +6,7 @@
  * - Large status counters
  * - Stability detection: sentences commit when stable
  * - Pronunciation drill mode with streaming character display
- * - TTS via Windows SAPI (Kokoro TTS planned via local-ai-server)
+ * - TTS via Windows SAPI + server-based TTS (local-ai-server /v1/audio/speech)
  *
  * Build: clients\voice-test-gui\build.bat
  * Run:   bin\voice-test-gui.exe
@@ -175,7 +175,18 @@ static int   g_drill_copy_row = -1;   /* 0=target, 1=result */
 static ISpVoice *g_tts_voice = NULL;
 static int g_tts_enabled = 1;
 
-/* TTS via Windows SAPI (Kokoro TTS planned via local-ai-server endpoint) */
+/* Server-based TTS (local-ai-server /v1/audio/speech) */
+#define TTS_SERVER_PORT 8090
+#define TTS_RESPONSE_BUF (4 * 1024 * 1024)  /* 4 MB for WAV data */
+static HWAVEOUT g_waveout = NULL;
+static HANDLE g_waveout_done_event = NULL;
+static volatile LONG g_tts_interrupt = 0;
+static char *g_tts_pending_text = NULL;
+static CRITICAL_SECTION g_tts_lock;
+static HANDLE g_tts_request_event = NULL;
+static HANDLE g_tts_shutdown_event = NULL;
+static HANDLE g_tts_thread = NULL;
+static volatile int g_tts_state = 0;  /* 0=idle, 1=generating, 2=speaking */
 
 /* System/hardware info (queried once at startup) */
 static char g_os_version[64] = "";
@@ -376,97 +387,10 @@ static int dir_exists(const char *path) {
     return (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
-/* Kokoro TTS removed -- will be served via local-ai-server /v1/audio/speech */
-#if 0  /* REMOVED: sherpa-onnx Kokoro TTS */
+/* Forward declaration (defined later with LLM code) */
+static int json_escape(const char *src, char *dst, int dst_size);
 
-/* Initialize Kokoro TTS via sherpa-onnx. Returns 1 on success, 0 on failure. */
-static int kokoro_init(void) {
-    char model_path[MAX_PATH], voices_path[MAX_PATH], tokens_path[MAX_PATH],
-         espeak_path[MAX_PATH];
-
-    if (resolve_exe_relative("kokoro-en-v0_19\\model.onnx", model_path, MAX_PATH) != 0 ||
-        resolve_exe_relative("kokoro-en-v0_19\\voices.bin", voices_path, MAX_PATH) != 0 ||
-        resolve_exe_relative("kokoro-en-v0_19\\tokens.txt", tokens_path, MAX_PATH) != 0 ||
-        resolve_exe_relative("kokoro-en-v0_19\\espeak-ng-data", espeak_path, MAX_PATH) != 0) {
-        log_event("KOKORO", "Failed to resolve model paths");
-        return 0;
-    }
-
-    if (!file_exists(model_path) || !file_exists(voices_path) ||
-        !file_exists(tokens_path) || !dir_exists(espeak_path)) {
-        log_event("KOKORO", "Model files not found — falling back to SAPI");
-        return 0;
-    }
-
-    SherpaOnnxOfflineTtsConfig config;
-    memset(&config, 0, sizeof(config));
-    config.model.kokoro.model = model_path;
-    config.model.kokoro.voices = voices_path;
-    config.model.kokoro.tokens = tokens_path;
-    config.model.kokoro.data_dir = espeak_path;
-    config.model.kokoro.length_scale = g_kokoro_speed;
-    config.model.num_threads = 2;
-    config.model.debug = 0;
-
-    g_kokoro_tts = SherpaOnnxCreateOfflineTts(&config);
-    if (!g_kokoro_tts) {
-        log_event("KOKORO", "SherpaOnnxCreateOfflineTts failed");
-        return 0;
-    }
-
-    g_kokoro_num_speakers = SherpaOnnxOfflineTtsNumSpeakers(g_kokoro_tts);
-    char init_msg[64];
-    snprintf(init_msg, sizeof(init_msg), "Initialized, %d speakers", g_kokoro_num_speakers);
-    log_event("KOKORO", init_msg);
-    return 1;
-}
-
-static void kokoro_shutdown(void) {
-    if (g_kokoro_tts) {
-        SherpaOnnxDestroyOfflineTts(g_kokoro_tts);
-        g_kokoro_tts = NULL;
-    }
-}
-
-/* ---- Kokoro config persistence ---- */
-
-static int kokoro_config_path(char *out, size_t sz) {
-    return resolve_exe_relative("kokoro_voice.cfg", out, sz);
-}
-
-static void kokoro_config_load(void) {
-    char path[MAX_PATH];
-    if (kokoro_config_path(path, MAX_PATH) != 0) return;
-    FILE *f = fopen(path, "r");
-    if (!f) return;
-    char line[128];
-    while (fgets(line, sizeof(line), f)) {
-        int iv; float fv;
-        if (sscanf(line, "speaker_id=%d", &iv) == 1) {
-            g_kokoro_speaker_id = iv;
-        } else if (sscanf(line, "speed=%f", &fv) == 1) {
-            g_kokoro_speed = fv;
-        }
-    }
-    fclose(f);
-    /* Clamp to valid ranges */
-    if (g_kokoro_speaker_id < 0) g_kokoro_speaker_id = 0;
-    if (g_kokoro_speed < 0.5f) g_kokoro_speed = 0.5f;
-    if (g_kokoro_speed > 2.0f) g_kokoro_speed = 2.0f;
-    log_event("KOKORO", "Loaded config");
-}
-
-static void kokoro_config_save(void) {
-    char path[MAX_PATH];
-    if (kokoro_config_path(path, MAX_PATH) != 0) return;
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "speaker_id=%d\n", g_kokoro_speaker_id);
-    fprintf(f, "speed=%.1f\n", g_kokoro_speed);
-    fclose(f);
-}
-
-/* ---- waveOut playback ---- */
+/* ---- waveOut playback (int16 PCM from server WAV) ---- */
 
 /* Open waveOut device at given sample rate, mono 16-bit PCM. Returns 1 on success. */
 static int waveout_open(int sample_rate) {
@@ -508,50 +432,23 @@ static void waveout_close(void) {
     }
 }
 
-/* Play float audio samples through waveOut. Returns 0 = played fully, 1 = interrupted. */
-static int waveout_play(const float *samples, int n_samples, int sample_rate) {
-    (void)sample_rate;
+/* Play int16 PCM samples through waveOut. Returns 0 = played fully, 1 = interrupted. */
+static int waveout_play_pcm(const int16_t *samples, int n_samples) {
     if (!g_waveout || n_samples <= 0) return 0;
 
-    /* Find peak amplitude and normalize to avoid clipping */
-    float peak = 0.0f;
-    for (int i = 0; i < n_samples; i++) {
-        float a = fabsf(samples[i]);
-        if (a > peak) peak = a;
-    }
-    /* Scale so peak maps to ~90% of int16 range (headroom) */
-    float scale = 32767.0f;
-    if (peak > 0.9f) {
-        scale = 32767.0f * 0.9f / peak;
-    }
-
-    /* Convert float to int16 with normalization */
-    int16_t *pcm = (int16_t *)malloc(n_samples * sizeof(int16_t));
-    if (!pcm) return 0;
-    for (int i = 0; i < n_samples; i++) {
-        float s = samples[i] * scale;
-        if (s > 32767.0f) s = 32767.0f;
-        if (s < -32768.0f) s = -32768.0f;
-        pcm[i] = (int16_t)s;
-    }
-
-    /* Submit entire buffer as one WAVEHDR — avoids gaps between chunks */
+    /* Submit entire buffer as one WAVEHDR */
     int interrupted = 0;
     WAVEHDR hdr = {0};
-    hdr.lpData = (LPSTR)pcm;
+    hdr.lpData = (LPSTR)samples;
     hdr.dwBufferLength = (DWORD)(n_samples * sizeof(int16_t));
 
     MMRESULT mr = waveOutPrepareHeader(g_waveout, &hdr, sizeof(hdr));
-    if (mr != MMSYSERR_NOERROR) {
-        free(pcm);
-        return 0;
-    }
+    if (mr != MMSYSERR_NOERROR) return 0;
 
     ResetEvent(g_waveout_done_event);
     mr = waveOutWrite(g_waveout, &hdr, sizeof(hdr));
     if (mr != MMSYSERR_NOERROR) {
         waveOutUnprepareHeader(g_waveout, &hdr, sizeof(hdr));
-        free(pcm);
         return 0;
     }
 
@@ -568,12 +465,138 @@ static int waveout_play(const float *samples, int n_samples, int sample_rate) {
     }
 
     waveOutUnprepareHeader(g_waveout, &hdr, sizeof(hdr));
-
-    free(pcm);
     return interrupted;
 }
 
-/* ---- TTS worker thread ---- */
+/* ---- TTS HTTP client (local-ai-server /v1/audio/speech) ---- */
+
+/* POST to TTS server, receive WAV bytes. Returns 0 on success, -1 on failure.
+ * Caller must free *wav_out. */
+static int tts_request(const char *text, char **wav_out, int *wav_len) {
+    *wav_out = NULL;
+    *wav_len = 0;
+
+    HINTERNET hSession = WinHttpOpen(L"VoiceNoteGUI/1.0",
+                                      WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                      WINHTTP_NO_PROXY_NAME,
+                                      WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return -1;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, L"localhost",
+                                         TTS_SERVER_PORT, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
+                                             L"/v1/audio/speech",
+                                             NULL, WINHTTP_NO_REFERER,
+                                             WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    /* 5s connect, 60s receive (TTS generation can be slow) */
+    WinHttpSetTimeouts(hRequest, 5000, 5000, 60000, 60000);
+
+    /* Build JSON body: {"input":"<text>","voice":"default","response_format":"wav"} */
+    char escaped[4096];
+    json_escape(text, escaped, sizeof(escaped));
+    char body[8192];
+    snprintf(body, sizeof(body),
+             "{\"input\":\"%s\",\"voice\":\"default\",\"response_format\":\"wav\"}",
+             escaped);
+
+    DWORD body_len = (DWORD)strlen(body);
+    BOOL ok = WinHttpSendRequest(hRequest,
+                                  L"Content-Type: application/json\r\n",
+                                  (DWORD)-1L,
+                                  body, body_len, body_len, 0);
+
+    if (ok) ok = WinHttpReceiveResponse(hRequest, NULL);
+
+    int result = -1;
+    if (ok) {
+        /* Check HTTP status */
+        DWORD status_code = 0;
+        DWORD sz = sizeof(status_code);
+        WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            NULL, &status_code, &sz, NULL);
+        if (status_code != 200) {
+            char errmsg[64];
+            snprintf(errmsg, sizeof(errmsg), "TTS server returned HTTP %lu", status_code);
+            log_event("TTS_SRV", errmsg);
+        } else {
+            /* Read WAV data */
+            char *buf = (char *)malloc(TTS_RESPONSE_BUF);
+            if (buf) {
+                DWORD total = 0, bytes_read = 0;
+                while (WinHttpReadData(hRequest, buf + total,
+                                        TTS_RESPONSE_BUF - total, &bytes_read)) {
+                    if (bytes_read == 0) break;
+                    total += bytes_read;
+                    if (total >= (DWORD)TTS_RESPONSE_BUF) break;
+                }
+                if (total > 0) {
+                    *wav_out = buf;
+                    *wav_len = (int)total;
+                    result = 0;
+                } else {
+                    free(buf);
+                }
+            }
+        }
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
+/* Parse WAV header to find PCM data. Returns 0 on success.
+ * Sets *pcm_out to point into wav_data (not a new allocation),
+ * *n_samples to sample count, *sample_rate to Hz. */
+static int wav_parse_header(const char *wav_data, int wav_len,
+                            const int16_t **pcm_out, int *n_samples, int *sample_rate) {
+    if (wav_len < 44) return -1;
+    if (memcmp(wav_data, "RIFF", 4) != 0) return -1;
+    if (memcmp(wav_data + 8, "WAVE", 4) != 0) return -1;
+
+    /* Walk chunks to find "fmt " and "data" */
+    int fmt_found = 0;
+    int sr = 0, bits = 0, channels = 0;
+    int pos = 12;
+    while (pos + 8 <= wav_len) {
+        const char *chunk_id = wav_data + pos;
+        int chunk_size = *(const int32_t *)(wav_data + pos + 4);
+        if (chunk_size < 0 || pos + 8 + chunk_size > wav_len) break;
+
+        if (memcmp(chunk_id, "fmt ", 4) == 0 && chunk_size >= 16) {
+            int16_t format = *(const int16_t *)(wav_data + pos + 8);
+            if (format != 1) return -1;  /* not PCM */
+            channels = *(const int16_t *)(wav_data + pos + 10);
+            sr = *(const int32_t *)(wav_data + pos + 12);
+            bits = *(const int16_t *)(wav_data + pos + 22);
+            fmt_found = 1;
+        } else if (memcmp(chunk_id, "data", 4) == 0 && fmt_found) {
+            if (bits != 16 || channels != 1) return -1;  /* only mono 16-bit */
+            *pcm_out = (const int16_t *)(wav_data + pos + 8);
+            *n_samples = chunk_size / sizeof(int16_t);
+            *sample_rate = sr;
+            return 0;
+        }
+
+        pos += 8 + chunk_size;
+        if (chunk_size & 1) pos++;  /* chunks are 2-byte aligned */
+    }
+    return -1;
+}
+
+/* ---- TTS worker thread (server-based) ---- */
 
 static DWORD WINAPI tts_worker_proc(LPVOID param) {
     (void)param;
@@ -591,43 +614,61 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
 
         if (!text) continue;
 
-        /* Clear interrupt flag before synthesis */
+        /* Clear interrupt flag before request */
         InterlockedExchange(&g_tts_interrupt, 0);
 
-        /* Check if already interrupted before we even start */
-        if (InterlockedCompareExchange(&g_tts_interrupt, 0, 0)) {
-            free(text);
-            continue;
-        }
-
-        log_event("KOKORO", "Generating speech...");
+        log_event("TTS_SRV", "Requesting speech...");
         PostMessageA(g_hwnd_main, WM_TTS_STATUS, 1, 0); /* generating */
-        const SherpaOnnxGeneratedAudio *audio =
-            SherpaOnnxOfflineTtsGenerate(g_kokoro_tts, text, g_kokoro_speaker_id,
-                                          g_kokoro_speed);
+
+        char *wav_data = NULL;
+        int wav_len = 0;
+        int rc = tts_request(text, &wav_data, &wav_len);
         free(text);
 
-        if (!audio || audio->n <= 0) {
-            log_event("KOKORO", "Generation returned no audio");
-            if (audio) SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
+        if (rc != 0 || !wav_data) {
+            log_event("TTS_SRV", "Request failed");
             PostMessageA(g_hwnd_main, WM_TTS_STATUS, 0, 0); /* idle */
+            free(wav_data);
             continue;
         }
 
-        char msg[64];
-        snprintf(msg, sizeof(msg), "Generated %d samples at %d Hz",
-                 audio->n, audio->sample_rate);
-        log_event("KOKORO", msg);
-
-        /* Play the generated audio */
-        PostMessageA(g_hwnd_main, WM_TTS_STATUS, 2, 0); /* speaking */
-        int was_interrupted = waveout_play(audio->samples, audio->n, audio->sample_rate);
-        SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
-        PostMessageA(g_hwnd_main, WM_TTS_STATUS, 0, 0); /* idle */
-
-        if (was_interrupted) {
-            log_event("KOKORO", "Playback interrupted");
+        /* Check interrupt after network request */
+        if (InterlockedCompareExchange(&g_tts_interrupt, 0, 0)) {
+            log_event("TTS_SRV", "Interrupted after download");
+            free(wav_data);
+            PostMessageA(g_hwnd_main, WM_TTS_STATUS, 0, 0);
+            continue;
         }
+
+        /* Parse WAV header */
+        const int16_t *pcm = NULL;
+        int n_samples = 0, sr = 0;
+        if (wav_parse_header(wav_data, wav_len, &pcm, &n_samples, &sr) != 0) {
+            log_event("TTS_SRV", "Failed to parse WAV header");
+            free(wav_data);
+            PostMessageA(g_hwnd_main, WM_TTS_STATUS, 0, 0);
+            continue;
+        }
+
+        char msg[80];
+        snprintf(msg, sizeof(msg), "Received %d samples at %d Hz (%.1fs)",
+                 n_samples, sr, (double)n_samples / sr);
+        log_event("TTS_SRV", msg);
+
+        /* Open waveOut at the WAV sample rate, play, close */
+        if (waveout_open(sr)) {
+            PostMessageA(g_hwnd_main, WM_TTS_STATUS, 2, 0); /* speaking */
+            int was_interrupted = waveout_play_pcm(pcm, n_samples);
+            waveout_close();
+            if (was_interrupted) {
+                log_event("TTS_SRV", "Playback interrupted");
+            }
+        } else {
+            log_event("TTS_SRV", "waveout_open failed");
+        }
+
+        free(wav_data);
+        PostMessageA(g_hwnd_main, WM_TTS_STATUS, 0, 0); /* idle */
     }
 
     return 0;
@@ -638,29 +679,32 @@ static int tts_worker_start(void) {
     g_tts_request_event = CreateEventA(NULL, FALSE, FALSE, NULL);   /* auto-reset */
     g_tts_shutdown_event = CreateEventA(NULL, TRUE, FALSE, NULL);   /* manual-reset */
     if (!g_tts_request_event || !g_tts_shutdown_event) {
-        log_event("KOKORO", "Failed to create worker events");
+        log_event("TTS_SRV", "Failed to create worker events");
         return 0;
     }
 
     g_tts_thread = CreateThread(NULL, 0, tts_worker_proc, NULL, 0, NULL);
     if (!g_tts_thread) {
-        log_event("KOKORO", "Failed to create worker thread");
+        log_event("TTS_SRV", "Failed to create worker thread");
         return 0;
     }
 
-    log_event("KOKORO", "Worker thread started");
+    log_event("TTS_SRV", "Worker thread started");
     return 1;
 }
 
 static void tts_worker_stop(void) {
+    /* Signal interrupt + shutdown */
+    InterlockedExchange(&g_tts_interrupt, 1);
     if (g_tts_shutdown_event) {
         SetEvent(g_tts_shutdown_event);
     }
     if (g_tts_thread) {
-        WaitForSingleObject(g_tts_thread, 3000);
+        WaitForSingleObject(g_tts_thread, 5000);
         CloseHandle(g_tts_thread);
         g_tts_thread = NULL;
     }
+    waveout_close();
     if (g_tts_request_event) {
         CloseHandle(g_tts_request_event);
         g_tts_request_event = NULL;
@@ -676,7 +720,23 @@ static void tts_worker_stop(void) {
     DeleteCriticalSection(&g_tts_lock);
 }
 
-#endif /* REMOVED: sherpa-onnx Kokoro TTS */
+/* Queue text for server TTS playback (non-blocking). */
+static void tts_speak_server(const char *text) {
+    if (!text || !text[0]) return;
+
+    /* Interrupt any in-progress playback */
+    InterlockedExchange(&g_tts_interrupt, 1);
+
+    char *copy = _strdup(text);
+    if (!copy) return;
+
+    EnterCriticalSection(&g_tts_lock);
+    free(g_tts_pending_text);
+    g_tts_pending_text = copy;
+    LeaveCriticalSection(&g_tts_lock);
+
+    SetEvent(g_tts_request_event);
+}
 
 /* ---- Local LLM (llama-server HTTP) ---- */
 
@@ -3432,8 +3492,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_TTS_STATUS: {
+            g_tts_state = (int)wParam;
             /* Update label to show TTS state with correct mode prefix */
-            const char *prefix = g_tutor_mode ? "Tutor"
+            const char *prefix = g_drill_mode ? "Drill"
+                               : g_tutor_mode ? "Tutor"
                                : (g_llm_mode == LLM_MODE_LOCAL) ? "LLM" : "Claude";
             const char *label;
             char label_buf[64];
@@ -3452,6 +3514,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     break;
             }
             SetWindowTextA(g_hwnd_lbl_claude, label);
+            if (g_drill_mode && g_hwnd_drill)
+                InvalidateRect(g_hwnd_drill, NULL, FALSE);
             return 0;
         }
 
@@ -3486,7 +3550,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             /* Shut down LLM worker */
             llm_worker_stop();
-            /* Release TTS */
+            /* Shut down server TTS worker */
+            tts_worker_stop();
+            /* Release SAPI TTS */
             if (g_tts_voice) {
                 ISpVoice_Release(g_tts_voice);
                 g_tts_voice = NULL;
@@ -3557,7 +3623,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         char *last = strrchr(exe_dir, '\\');
         if (last) *last = '\0';
         snprintf(g_drill_sentence_path, sizeof(g_drill_sentence_path),
-                 "%s\\..\\docs\\research\\voice_notes\\data\\drill_sentences.txt",
+                 "%s\\..\\data\\drill_sentences.txt",
                  exe_dir);
 
         /* Progress file in APPDATA */
@@ -3724,6 +3790,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Start LLM worker thread */
     llm_worker_start();
 
+    /* Start TTS worker thread (server-based) */
+    tts_worker_start();
+
     /* Start named pipe server thread */
     g_pipe_shutdown_event = CreateEventA(NULL, TRUE, FALSE, NULL);  /* manual reset */
     g_pipe_running = 1;
@@ -3757,6 +3826,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                     InvalidateRect(g_hwnd_drill, NULL, FALSE);
             }
             if (!g_ptt_held && !g_is_recording) {
+                /* Interrupt any TTS playback before recording */
+                InterlockedExchange(&g_tts_interrupt, 1);
                 g_ptt_held = 1;
                 g_ptt_start_tick = GetTickCount();
                 start_recording();
@@ -3797,6 +3868,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         /* V key: reserved for future TTS voice selection via server */
         if (msg.message == WM_KEYDOWN && msg.wParam == 'V'
             && !(GetKeyState(VK_CONTROL) & 0x8000)) {
+            continue;
+        }
+        /* L key: in drill mode, speak target sentence via server TTS */
+        if (msg.message == WM_KEYDOWN && msg.wParam == 'L'
+            && !(GetKeyState(VK_CONTROL) & 0x8000)
+            && g_drill_mode && !g_is_recording) {
+            DrillSentence *sent = &g_drill_state.sentences[g_drill_state.current_idx];
+            if (sent->chinese[0]) {
+                log_event("TTS_SRV", "L key — speaking target sentence");
+                tts_speak_server(sent->chinese);
+            }
             continue;
         }
         /* L key toggles LLM mode (Shift+L = clear history) — blocked in tutor mode */
