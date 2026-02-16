@@ -186,7 +186,15 @@ static CRITICAL_SECTION g_tts_lock;
 static HANDLE g_tts_request_event = NULL;
 static HANDLE g_tts_shutdown_event = NULL;
 static HANDLE g_tts_thread = NULL;
-static volatile int g_tts_state = 0;  /* 0=idle, 1=generating, 2=speaking */
+static volatile int g_tts_state = 0;  /* 0=idle, 1=generating, 2=speaking, 3=error */
+
+/* Server TTS voice presets (Qwen3-TTS) */
+static const char *g_tts_voices[] = {
+    "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+    "Ryan", "Aiden", "Ono_Anna", "Sohee"
+};
+#define TTS_NUM_VOICES (sizeof(g_tts_voices) / sizeof(g_tts_voices[0]))
+static int g_tts_voice_idx = 0;  /* Vivian default */
 
 /* System/hardware info (queried once at startup) */
 static char g_os_version[64] = "";
@@ -502,13 +510,13 @@ static int tts_request(const char *text, char **wav_out, int *wav_len) {
     /* 5s connect, 60s receive (TTS generation can be slow) */
     WinHttpSetTimeouts(hRequest, 5000, 5000, 60000, 60000);
 
-    /* Build JSON body: {"input":"<text>","voice":"default","response_format":"wav"} */
+    /* Build JSON body: {"input":"<text>","voice":"<name>","response_format":"wav"} */
     char escaped[4096];
     json_escape(text, escaped, sizeof(escaped));
     char body[8192];
     snprintf(body, sizeof(body),
-             "{\"input\":\"%s\",\"voice\":\"default\",\"response_format\":\"wav\"}",
-             escaped);
+             "{\"input\":\"%s\",\"voice\":\"%s\",\"response_format\":\"wav\"}",
+             escaped, g_tts_voices[g_tts_voice_idx]);
 
     DWORD body_len = (DWORD)strlen(body);
     BOOL ok = WinHttpSendRequest(hRequest,
@@ -627,7 +635,7 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
 
         if (rc != 0 || !wav_data) {
             log_event("TTS_SRV", "Request failed");
-            PostMessageA(g_hwnd_main, WM_TTS_STATUS, 0, 0); /* idle */
+            PostMessageA(g_hwnd_main, WM_TTS_STATUS, 3, 0); /* error */
             free(wav_data);
             continue;
         }
@@ -2092,9 +2100,9 @@ static LRESULT CALLBACK StatsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             DrawTextA(hdc, "VOICE(V)", -1, &r8, DT_CENTER);
 
             RECT r8v = { col_width * 7, value_top, col_width * 8, h - 2 };
-            SetTextColor(hdc, COLOR_TEXT_DIM);
+            SetTextColor(hdc, COLOR_ACCENT);
             SelectObject(hdc, g_font_medium);
-            DrawTextA(hdc, "SAPI", -1, &r8v, DT_CENTER);
+            DrawTextA(hdc, g_tts_voices[g_tts_voice_idx], -1, &r8v, DT_CENTER);
 
             EndPaint(hwnd, &ps);
             return 0;
@@ -3508,6 +3516,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     snprintf(label_buf, sizeof(label_buf), "%s: [speaking...]", prefix);
                     label = label_buf;
                     break;
+                case 3:
+                    snprintf(label_buf, sizeof(label_buf), "%s: [TTS server unavailable]", prefix);
+                    label = label_buf;
+                    break;
                 default:
                     snprintf(label_buf, sizeof(label_buf), "%s:", prefix);
                     label = label_buf;
@@ -3852,8 +3864,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             }
             continue;
         }
-        /* T key toggles TTS */
+        /* T key toggles TTS (ignore auto-repeat) */
         if (msg.message == WM_KEYDOWN && msg.wParam == 'T'
+            && !(msg.lParam & (1 << 30))
             && !(GetKeyState(VK_CONTROL) & 0x8000)) {
             g_tts_enabled = !g_tts_enabled;
             log_event("TTS", g_tts_enabled ? "Enabled" : "Disabled");
@@ -3865,13 +3878,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             InvalidateRect(g_hwnd_stats, NULL, FALSE);
             continue;
         }
-        /* V key: reserved for future TTS voice selection via server */
+        /* V key: cycle TTS voice (Shift+V = backward, ignore auto-repeat) */
         if (msg.message == WM_KEYDOWN && msg.wParam == 'V'
+            && !(msg.lParam & (1 << 30))
             && !(GetKeyState(VK_CONTROL) & 0x8000)) {
+            if (GetKeyState(VK_SHIFT) & 0x8000) {
+                g_tts_voice_idx = (g_tts_voice_idx + (int)TTS_NUM_VOICES - 1) % (int)TTS_NUM_VOICES;
+            } else {
+                g_tts_voice_idx = (g_tts_voice_idx + 1) % (int)TTS_NUM_VOICES;
+            }
+            log_event("TTS", g_tts_voices[g_tts_voice_idx]);
+            InvalidateRect(g_hwnd_stats, NULL, FALSE);
+            if (g_drill_mode)
+                InvalidateRect(g_hwnd_drill, NULL, FALSE);
             continue;
         }
-        /* L key: in drill mode, speak target sentence via server TTS */
+        /* L key: in drill mode, speak target sentence via server TTS (ignore auto-repeat) */
         if (msg.message == WM_KEYDOWN && msg.wParam == 'L'
+            && !(msg.lParam & (1 << 30))
             && !(GetKeyState(VK_CONTROL) & 0x8000)
             && g_drill_mode && !g_is_recording) {
             DrillSentence *sent = &g_drill_state.sentences[g_drill_state.current_idx];
@@ -3881,8 +3905,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             }
             continue;
         }
-        /* L key toggles LLM mode (Shift+L = clear history) — blocked in tutor mode */
+        /* L key toggles LLM mode (Shift+L = clear history) -- blocked in tutor mode */
         if (msg.message == WM_KEYDOWN && msg.wParam == 'L'
+            && !(msg.lParam & (1 << 30))
             && !(GetKeyState(VK_CONTROL) & 0x8000)) {
             if (g_tutor_mode) {
                 log_event("LLM", "L key blocked — tutor mode requires local LLM");
@@ -3907,8 +3932,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             InvalidateRect(g_hwnd_stats, NULL, FALSE);
             continue;
         }
-        /* M key toggles Mandarin Tutor mode */
+        /* M key toggles Mandarin Tutor mode (ignore auto-repeat) */
         if (msg.message == WM_KEYDOWN && msg.wParam == 'M'
+            && !(msg.lParam & (1 << 30))
             && !(GetKeyState(VK_CONTROL) & 0x8000)
             && !(GetKeyState(VK_SHIFT) & 0x8000)) {
             if (g_is_recording) {
@@ -3949,8 +3975,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             && !(GetKeyState(VK_CONTROL) & 0x8000)) {
             continue;
         }
-        /* D key toggles Pronunciation Drill mode */
+        /* D key toggles Pronunciation Drill mode (ignore auto-repeat) */
         if (msg.message == WM_KEYDOWN && msg.wParam == 'D'
+            && !(msg.lParam & (1 << 30))
             && !(GetKeyState(VK_CONTROL) & 0x8000)
             && !(GetKeyState(VK_SHIFT) & 0x8000)) {
             if (g_is_recording) {

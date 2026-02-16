@@ -435,12 +435,23 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             if (g_tts_state == 1) {
                 SetTextColor(hdc, RGB(200, 180, 80));
                 RECT fb_rc = { margin, status_y, w / 3, status_y + 24 };
-                DrawTextA(hdc, "Generating audio...", -1, &fb_rc,
+                char tts_msg[64];
+                snprintf(tts_msg, sizeof(tts_msg), "Generating [%s]...",
+                         g_tts_voices[g_tts_voice_idx]);
+                DrawTextA(hdc, tts_msg, -1, &fb_rc,
                           DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             } else if (g_tts_state == 2) {
                 SetTextColor(hdc, RGB(100, 200, 255));
                 RECT fb_rc = { margin, status_y, w / 3, status_y + 24 };
-                DrawTextA(hdc, ">> Playing  L:stop", -1, &fb_rc,
+                char play_msg[64];
+                snprintf(play_msg, sizeof(play_msg), ">> %s  L:stop",
+                         g_tts_voices[g_tts_voice_idx]);
+                DrawTextA(hdc, play_msg, -1, &fb_rc,
+                          DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            } else if (g_tts_state == 3) {
+                SetTextColor(hdc, RGB(220, 80, 80));
+                RECT fb_rc = { margin, status_y, w / 3, status_y + 24 };
+                DrawTextA(hdc, "TTS server unavailable", -1, &fb_rc,
                           DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             } else if (g_drill_state.has_result) {
                 const char *feedback;
