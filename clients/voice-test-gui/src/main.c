@@ -181,7 +181,10 @@ static int g_tts_enabled = 1;
 static HWAVEOUT g_waveout = NULL;
 static HANDLE g_waveout_done_event = NULL;
 static volatile LONG g_tts_interrupt = 0;
+static volatile HINTERNET g_tts_worker_hrequest = NULL;  /* in-flight HTTP for cancellation */
 static char *g_tts_pending_text = NULL;
+static int g_tts_pending_voice_idx = 0;
+static int g_tts_pending_sentence_idx = -1;
 static CRITICAL_SECTION g_tts_lock;
 static HANDLE g_tts_request_event = NULL;
 static HANDLE g_tts_shutdown_event = NULL;
@@ -195,6 +198,29 @@ static const char *g_tts_voices[] = {
 };
 #define TTS_NUM_VOICES (sizeof(g_tts_voices) / sizeof(g_tts_voices[0]))
 static int g_tts_voice_idx = 0;  /* Vivian default */
+
+/* TTS pre-fetch cache */
+#define TTS_CACHE_SIZE 3
+
+typedef struct {
+    int   sentence_idx;  /* -1 = empty */
+    int   voice_idx;
+    char *wav_data;      /* malloc'd WAV bytes */
+    int   wav_len;
+} TtsCacheEntry;
+
+static TtsCacheEntry    g_tts_cache[TTS_CACHE_SIZE];
+static CRITICAL_SECTION g_tts_cache_lock;
+
+/* TTS pre-fetch thread */
+static HANDLE           g_tts_prefetch_event     = NULL;  /* auto-reset */
+static HANDLE           g_tts_prefetch_shutdown   = NULL;  /* manual-reset */
+static HANDLE           g_tts_prefetch_thread     = NULL;
+static volatile LONG    g_tts_prefetch_cancel     = 0;
+static volatile HINTERNET g_tts_prefetch_hrequest = NULL;  /* in-flight HTTP for cancellation */
+static int              g_tts_prefetch_targets[TTS_CACHE_SIZE]; /* desired sentence indices */
+static int              g_tts_prefetch_voice_idx  = 0;
+static CRITICAL_SECTION g_tts_prefetch_lock;  /* protects targets + voice_idx */
 
 /* System/hardware info (queried once at startup) */
 static char g_os_version[64] = "";
@@ -479,8 +505,12 @@ static int waveout_play_pcm(const int16_t *samples, int n_samples) {
 /* ---- TTS HTTP client (local-ai-server /v1/audio/speech) ---- */
 
 /* POST to TTS server, receive WAV bytes. Returns 0 on success, -1 on failure.
- * Caller must free *wav_out. */
-static int tts_request(const char *text, char **wav_out, int *wav_len) {
+ * Caller must free *wav_out.
+ * cancel_handle (optional): published for external cancellation via
+ * WinHttpCloseHandle from another thread. InterlockedExchangePointer ensures
+ * exactly one side (caller or canceller) closes the request handle. */
+static int tts_request(const char *text, const char *voice, char **wav_out, int *wav_len,
+                       volatile HINTERNET *cancel_handle) {
     *wav_out = NULL;
     *wav_len = 0;
 
@@ -507,6 +537,10 @@ static int tts_request(const char *text, char **wav_out, int *wav_len) {
         return -1;
     }
 
+    /* Publish handle so another thread can close it to abort blocking I/O */
+    if (cancel_handle)
+        InterlockedExchangePointer((volatile PVOID *)cancel_handle, hRequest);
+
     /* 5s connect, 60s receive (TTS generation can be slow) */
     WinHttpSetTimeouts(hRequest, 5000, 5000, 60000, 60000);
 
@@ -516,7 +550,7 @@ static int tts_request(const char *text, char **wav_out, int *wav_len) {
     char body[8192];
     snprintf(body, sizeof(body),
              "{\"input\":\"%s\",\"voice\":\"%s\",\"response_format\":\"wav\"}",
-             escaped, g_tts_voices[g_tts_voice_idx]);
+             escaped, voice);
 
     DWORD body_len = (DWORD)strlen(body);
     BOOL ok = WinHttpSendRequest(hRequest,
@@ -559,7 +593,13 @@ static int tts_request(const char *text, char **wav_out, int *wav_len) {
         }
     }
 
-    WinHttpCloseHandle(hRequest);
+    /* Reclaim handle: if external cancel already closed it, skip our close.
+     * Both sides race to swap the slot to NULL; the winner closes. */
+    if (cancel_handle) {
+        if (!InterlockedExchangePointer((volatile PVOID *)cancel_handle, NULL))
+            hRequest = NULL;
+    }
+    if (hRequest) WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
     return result;
@@ -604,6 +644,122 @@ static int wav_parse_header(const char *wav_data, int wav_len,
     return -1;
 }
 
+/* ---- TTS pre-fetch cache ---- */
+
+/* Returns 1 on hit, removes entry. Caller owns returned wav data. */
+static int tts_cache_take(int sentence_idx, int voice_idx, char **wav, int *len) {
+    int found = 0;
+    EnterCriticalSection(&g_tts_cache_lock);
+    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
+        if (g_tts_cache[i].sentence_idx == sentence_idx
+            && g_tts_cache[i].voice_idx == voice_idx) {
+            *wav = g_tts_cache[i].wav_data;
+            *len = g_tts_cache[i].wav_len;
+            g_tts_cache[i].sentence_idx = -1;
+            g_tts_cache[i].wav_data = NULL;
+            g_tts_cache[i].wav_len = 0;
+            found = 1;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_tts_cache_lock);
+    return found;
+}
+
+/* Store entry. Overwrites duplicate key, else uses empty slot, else evicts oldest. */
+static void tts_cache_put(int sentence_idx, int voice_idx, char *wav, int len) {
+    EnterCriticalSection(&g_tts_cache_lock);
+    int slot = -1;
+    /* Overwrite existing entry with same key */
+    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
+        if (g_tts_cache[i].sentence_idx == sentence_idx
+            && g_tts_cache[i].voice_idx == voice_idx) {
+            free(g_tts_cache[i].wav_data);
+            slot = i;
+            break;
+        }
+    }
+    /* Find empty slot */
+    if (slot < 0) {
+        for (int i = 0; i < TTS_CACHE_SIZE; i++) {
+            if (g_tts_cache[i].sentence_idx == -1) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    /* No empty slot: evict slot 0 (oldest) */
+    if (slot < 0) {
+        free(g_tts_cache[0].wav_data);
+        for (int i = 0; i < TTS_CACHE_SIZE - 1; i++)
+            g_tts_cache[i] = g_tts_cache[i + 1];
+        slot = TTS_CACHE_SIZE - 1;
+        g_tts_cache[slot].sentence_idx = -1;
+        g_tts_cache[slot].wav_data = NULL;
+    }
+    g_tts_cache[slot].sentence_idx = sentence_idx;
+    g_tts_cache[slot].voice_idx = voice_idx;
+    g_tts_cache[slot].wav_data = wav;
+    g_tts_cache[slot].wav_len = len;
+    LeaveCriticalSection(&g_tts_cache_lock);
+}
+
+/* Free all cache entries. */
+static void tts_cache_clear(void) {
+    EnterCriticalSection(&g_tts_cache_lock);
+    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
+        free(g_tts_cache[i].wav_data);
+        g_tts_cache[i].wav_data = NULL;
+        g_tts_cache[i].wav_len = 0;
+        g_tts_cache[i].sentence_idx = -1;
+    }
+    LeaveCriticalSection(&g_tts_cache_lock);
+}
+
+/* Non-destructive check: returns 1 if entry exists in cache. */
+static int tts_cache_has(int sentence_idx, int voice_idx) {
+    int found = 0;
+    EnterCriticalSection(&g_tts_cache_lock);
+    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
+        if (g_tts_cache[i].sentence_idx == sentence_idx
+            && g_tts_cache[i].voice_idx == voice_idx) {
+            found = 1;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_tts_cache_lock);
+    return found;
+}
+
+/* Evict entries that don't match voice_idx or aren't in the keep list. */
+static void tts_cache_evict_stale(int voice_idx, const int *keep, int keep_count) {
+    EnterCriticalSection(&g_tts_cache_lock);
+    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
+        if (g_tts_cache[i].sentence_idx < 0) continue;
+        if (g_tts_cache[i].voice_idx != voice_idx) {
+            free(g_tts_cache[i].wav_data);
+            g_tts_cache[i].wav_data = NULL;
+            g_tts_cache[i].wav_len = 0;
+            g_tts_cache[i].sentence_idx = -1;
+            continue;
+        }
+        int stale = 1;
+        for (int j = 0; j < keep_count; j++) {
+            if (keep[j] == g_tts_cache[i].sentence_idx) {
+                stale = 0;
+                break;
+            }
+        }
+        if (stale) {
+            free(g_tts_cache[i].wav_data);
+            g_tts_cache[i].wav_data = NULL;
+            g_tts_cache[i].wav_len = 0;
+            g_tts_cache[i].sentence_idx = -1;
+        }
+    }
+    LeaveCriticalSection(&g_tts_cache_lock);
+}
+
 /* ---- TTS worker thread (server-based) ---- */
 
 static DWORD WINAPI tts_worker_proc(LPVOID param) {
@@ -614,10 +770,12 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
         DWORD which = WaitForMultipleObjects(2, events, FALSE, INFINITE);
         if (which != WAIT_OBJECT_0) break; /* shutdown */
 
-        /* Grab pending text */
+        /* Grab pending text, voice, and sentence index */
         EnterCriticalSection(&g_tts_lock);
         char *text = g_tts_pending_text;
         g_tts_pending_text = NULL;
+        int voice_idx = g_tts_pending_voice_idx;
+        int sentence_idx = g_tts_pending_sentence_idx;
         LeaveCriticalSection(&g_tts_lock);
 
         if (!text) continue;
@@ -625,27 +783,39 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
         /* Clear interrupt flag before request */
         InterlockedExchange(&g_tts_interrupt, 0);
 
-        log_event("TTS_SRV", "Requesting speech...");
-        PostMessageA(g_hwnd_main, WM_TTS_STATUS, 1, 0); /* generating */
-
+        /* Check cache first */
         char *wav_data = NULL;
         int wav_len = 0;
-        int rc = tts_request(text, &wav_data, &wav_len);
-        free(text);
+        int from_cache = 0;
 
-        if (rc != 0 || !wav_data) {
-            log_event("TTS_SRV", "Request failed");
-            PostMessageA(g_hwnd_main, WM_TTS_STATUS, 3, 0); /* error */
-            free(wav_data);
-            continue;
+        if (sentence_idx >= 0 && tts_cache_take(sentence_idx, voice_idx, &wav_data, &wav_len)) {
+            log_event("TTS_SRV", "Cache hit");
+            free(text);
+            from_cache = 1;
         }
 
-        /* Check interrupt after network request */
-        if (InterlockedCompareExchange(&g_tts_interrupt, 0, 0)) {
-            log_event("TTS_SRV", "Interrupted after download");
-            free(wav_data);
-            PostMessageA(g_hwnd_main, WM_TTS_STATUS, 0, 0);
-            continue;
+        if (!from_cache) {
+            log_event("TTS_SRV", "Requesting speech...");
+            PostMessageA(g_hwnd_main, WM_TTS_STATUS, 1, 0); /* generating */
+
+            int rc = tts_request(text, g_tts_voices[voice_idx], &wav_data, &wav_len,
+                                 &g_tts_worker_hrequest);
+            free(text);
+
+            if (rc != 0 || !wav_data) {
+                log_event("TTS_SRV", "Request failed");
+                PostMessageA(g_hwnd_main, WM_TTS_STATUS, 3, 0); /* error */
+                free(wav_data);
+                continue;
+            }
+
+            /* Check interrupt after network request */
+            if (InterlockedCompareExchange(&g_tts_interrupt, 0, 0)) {
+                log_event("TTS_SRV", "Interrupted after download");
+                free(wav_data);
+                PostMessageA(g_hwnd_main, WM_TTS_STATUS, 0, 0);
+                continue;
+            }
         }
 
         /* Parse WAV header */
@@ -684,6 +854,12 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
 
 static int tts_worker_start(void) {
     InitializeCriticalSection(&g_tts_lock);
+    InitializeCriticalSection(&g_tts_cache_lock);
+    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
+        g_tts_cache[i].sentence_idx = -1;
+        g_tts_cache[i].wav_data = NULL;
+        g_tts_cache[i].wav_len = 0;
+    }
     g_tts_request_event = CreateEventA(NULL, FALSE, FALSE, NULL);   /* auto-reset */
     g_tts_shutdown_event = CreateEventA(NULL, TRUE, FALSE, NULL);   /* manual-reset */
     if (!g_tts_request_event || !g_tts_shutdown_event) {
@@ -704,6 +880,12 @@ static int tts_worker_start(void) {
 static void tts_worker_stop(void) {
     /* Signal interrupt + shutdown */
     InterlockedExchange(&g_tts_interrupt, 1);
+    /* Cancel any in-flight HTTP request so thread unblocks immediately */
+    {
+        HINTERNET h = InterlockedExchangePointer(
+            (volatile PVOID *)&g_tts_worker_hrequest, NULL);
+        if (h) WinHttpCloseHandle(h);
+    }
     if (g_tts_shutdown_event) {
         SetEvent(g_tts_shutdown_event);
     }
@@ -726,10 +908,179 @@ static void tts_worker_stop(void) {
     g_tts_pending_text = NULL;
     LeaveCriticalSection(&g_tts_lock);
     DeleteCriticalSection(&g_tts_lock);
+    tts_cache_clear();
+    DeleteCriticalSection(&g_tts_cache_lock);
 }
 
-/* Queue text for server TTS playback (non-blocking). */
-static void tts_speak_server(const char *text) {
+/* ---- TTS pre-fetch thread ---- */
+
+static DWORD WINAPI tts_prefetch_proc(LPVOID param) {
+    (void)param;
+    HANDLE events[2] = { g_tts_prefetch_event, g_tts_prefetch_shutdown };
+
+    while (1) {
+        DWORD which = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+        if (which != WAIT_OBJECT_0) break; /* shutdown */
+
+        /* Snapshot targets under lock */
+        int targets[TTS_CACHE_SIZE];
+        int voice_idx;
+        EnterCriticalSection(&g_tts_prefetch_lock);
+        for (int i = 0; i < TTS_CACHE_SIZE; i++)
+            targets[i] = g_tts_prefetch_targets[i];
+        voice_idx = g_tts_prefetch_voice_idx;
+        LeaveCriticalSection(&g_tts_prefetch_lock);
+
+        /* Reset cancel flag */
+        InterlockedExchange(&g_tts_prefetch_cancel, 0);
+
+        for (int i = 0; i < TTS_CACHE_SIZE; i++) {
+            if (targets[i] < 0) continue;
+
+            /* Check if cancelled */
+            if (InterlockedCompareExchange(&g_tts_prefetch_cancel, 0, 0))
+                break;
+
+            /* Already cached? */
+            if (tts_cache_has(targets[i], voice_idx))
+                continue;
+
+            /* Fetch from server */
+            const char *text = g_drill_state.sentences[targets[i]].chinese;
+            if (!text[0]) continue;
+
+            char *wav_data = NULL;
+            int wav_len = 0;
+            int rc = tts_request(text, g_tts_voices[voice_idx], &wav_data, &wav_len,
+                                 &g_tts_prefetch_hrequest);
+
+            if (rc != 0 || !wav_data) {
+                free(wav_data);
+                break;  /* Server failure: stop, wait for next signal */
+            }
+
+            /* Check cancel + re-validate targets after HTTP call */
+            if (InterlockedCompareExchange(&g_tts_prefetch_cancel, 0, 0)) {
+                free(wav_data);
+                break;
+            }
+
+            /* Re-check that this target is still desired */
+            int still_wanted = 0;
+            EnterCriticalSection(&g_tts_prefetch_lock);
+            if (g_tts_prefetch_voice_idx == voice_idx) {
+                for (int j = 0; j < TTS_CACHE_SIZE; j++) {
+                    if (g_tts_prefetch_targets[j] == targets[i]) {
+                        still_wanted = 1;
+                        break;
+                    }
+                }
+            }
+            LeaveCriticalSection(&g_tts_prefetch_lock);
+
+            if (still_wanted) {
+                char pmsg[80];
+                snprintf(pmsg, sizeof(pmsg), "Prefetched sentence %d", targets[i]);
+                log_event("TTS_PRE", pmsg);
+                tts_cache_put(targets[i], voice_idx, wav_data, wav_len);
+            } else {
+                free(wav_data);
+            }
+        }
+    }
+
+    return 0;
+}
+
+static void tts_prefetch_start(void) {
+    InitializeCriticalSection(&g_tts_prefetch_lock);
+    for (int i = 0; i < TTS_CACHE_SIZE; i++)
+        g_tts_prefetch_targets[i] = -1;
+    g_tts_prefetch_voice_idx = g_tts_voice_idx;
+    InterlockedExchange(&g_tts_prefetch_cancel, 0);
+
+    g_tts_prefetch_event = CreateEventA(NULL, FALSE, FALSE, NULL);     /* auto-reset */
+    g_tts_prefetch_shutdown = CreateEventA(NULL, TRUE, FALSE, NULL);   /* manual-reset */
+    if (!g_tts_prefetch_event || !g_tts_prefetch_shutdown) {
+        log_event("TTS_PRE", "Failed to create prefetch events");
+        return;
+    }
+
+    g_tts_prefetch_thread = CreateThread(NULL, 0, tts_prefetch_proc, NULL, 0, NULL);
+    if (!g_tts_prefetch_thread) {
+        log_event("TTS_PRE", "Failed to create prefetch thread");
+        return;
+    }
+
+    log_event("TTS_PRE", "Prefetch thread started");
+}
+
+static void tts_prefetch_stop(void) {
+    InterlockedExchange(&g_tts_prefetch_cancel, 1);
+    /* Cancel any in-flight HTTP request so thread unblocks immediately */
+    {
+        HINTERNET h = InterlockedExchangePointer(
+            (volatile PVOID *)&g_tts_prefetch_hrequest, NULL);
+        if (h) WinHttpCloseHandle(h);
+    }
+    if (g_tts_prefetch_shutdown)
+        SetEvent(g_tts_prefetch_shutdown);
+    if (g_tts_prefetch_thread) {
+        WaitForSingleObject(g_tts_prefetch_thread, 5000);
+        CloseHandle(g_tts_prefetch_thread);
+        g_tts_prefetch_thread = NULL;
+    }
+    if (g_tts_prefetch_event) {
+        CloseHandle(g_tts_prefetch_event);
+        g_tts_prefetch_event = NULL;
+    }
+    if (g_tts_prefetch_shutdown) {
+        CloseHandle(g_tts_prefetch_shutdown);
+        g_tts_prefetch_shutdown = NULL;
+    }
+    /* Cache is owned by tts_worker lifetime (cleared in tts_worker_stop) */
+    DeleteCriticalSection(&g_tts_prefetch_lock);
+}
+
+/* Update prefetch targets: current sentence + predicted next 2.
+ * Call after drill_advance, voice change, or HSK filter change. */
+static void tts_prefetch_update(int current_sentence_idx) {
+    int targets[TTS_CACHE_SIZE];
+    targets[0] = current_sentence_idx;
+
+    /* Predict next 2 using deterministic peek */
+    int next[2] = { -1, -1 };
+    int n = drill_peek_next(&g_drill_state, current_sentence_idx, next, 2);
+    targets[1] = (n >= 1) ? next[0] : -1;
+    targets[2] = (n >= 2) ? next[1] : -1;
+
+    int voice = g_tts_voice_idx;
+
+    /* Cancel in-flight prefetch: flag + abort HTTP immediately */
+    InterlockedExchange(&g_tts_prefetch_cancel, 1);
+    {
+        HINTERNET h = InterlockedExchangePointer(
+            (volatile PVOID *)&g_tts_prefetch_hrequest, NULL);
+        if (h) WinHttpCloseHandle(h);
+    }
+
+    tts_cache_evict_stale(voice, targets, TTS_CACHE_SIZE);
+
+    /* Update targets under lock */
+    EnterCriticalSection(&g_tts_prefetch_lock);
+    for (int i = 0; i < TTS_CACHE_SIZE; i++)
+        g_tts_prefetch_targets[i] = targets[i];
+    g_tts_prefetch_voice_idx = voice;
+    LeaveCriticalSection(&g_tts_prefetch_lock);
+
+    /* Signal prefetch thread */
+    if (g_tts_prefetch_event)
+        SetEvent(g_tts_prefetch_event);
+}
+
+/* Queue text for server TTS playback (non-blocking).
+ * sentence_idx >= 0 enables cache lookup; -1 skips cache. */
+static void tts_speak_server(const char *text, int sentence_idx) {
     if (!text || !text[0]) return;
 
     /* Interrupt any in-progress playback */
@@ -741,6 +1092,8 @@ static void tts_speak_server(const char *text) {
     EnterCriticalSection(&g_tts_lock);
     free(g_tts_pending_text);
     g_tts_pending_text = copy;
+    g_tts_pending_voice_idx = g_tts_voice_idx;
+    g_tts_pending_sentence_idx = sentence_idx;
     LeaveCriticalSection(&g_tts_lock);
 
     SetEvent(g_tts_request_event);
@@ -3833,6 +4186,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             if (g_drill_mode && g_drill_state.has_result
                 && g_drill_state.last_diff.match && !g_is_recording) {
                 drill_advance(&g_drill_state);
+                tts_prefetch_update(g_drill_state.current_idx);
                 g_drill_stream_len = 0;
                 if (g_hwnd_drill)
                     InvalidateRect(g_hwnd_drill, NULL, FALSE);
@@ -3889,8 +4243,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             }
             log_event("TTS", g_tts_voices[g_tts_voice_idx]);
             InvalidateRect(g_hwnd_stats, NULL, FALSE);
-            if (g_drill_mode)
+            if (g_drill_mode) {
                 InvalidateRect(g_hwnd_drill, NULL, FALSE);
+                tts_prefetch_update(g_drill_state.current_idx);
+            }
             continue;
         }
         /* L key: in drill mode, speak target sentence via server TTS (ignore auto-repeat) */
@@ -3900,8 +4256,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             && g_drill_mode && !g_is_recording) {
             DrillSentence *sent = &g_drill_state.sentences[g_drill_state.current_idx];
             if (sent->chinese[0]) {
-                log_event("TTS_SRV", "L key — speaking target sentence");
-                tts_speak_server(sent->chinese);
+                log_event("TTS_SRV", "L key -- speaking target sentence");
+                tts_speak_server(sent->chinese, g_drill_state.current_idx);
             }
             continue;
         }
@@ -4001,11 +4357,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 srand((unsigned int)GetTickCount());
                 drill_advance(&g_drill_state);
                 g_drill_stream_len = 0;
+                tts_prefetch_start();
+                tts_prefetch_update(g_drill_state.current_idx);
 
                 SetWindowTextA(g_hwnd_lbl_claude, "Drill:");
                 log_event("DRILL", "Pronunciation Drill active");
             } else {
                 log_event("DRILL", "Exiting Pronunciation Drill mode");
+                tts_prefetch_stop();
                 drill_shutdown(&g_drill_state, g_drill_progress_path);
 
                 /* Restore language based on tutor mode */
@@ -4039,6 +4398,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                      g_drill_state.hsk_filter == 2 ? "HSK 2" : "HSK 3");
             log_event("DRILL", hmsg);
             drill_advance(&g_drill_state);
+            tts_prefetch_update(g_drill_state.current_idx);
             g_drill_stream_len = 0;
             if (g_hwnd_drill)
                 InvalidateRect(g_hwnd_drill, NULL, FALSE);
@@ -4053,8 +4413,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         fclose(g_log_file);
     }
     /* ASR model cleanup not needed -- transcription via HTTP server */
-    if (g_drill_mode)
+    if (g_drill_mode) {
+        tts_prefetch_stop();
         drill_shutdown(&g_drill_state, g_drill_progress_path);
+    }
     DeleteObject(g_font_large);
     DeleteObject(g_font_medium);
     DeleteObject(g_font_normal);

@@ -62,4 +62,9 @@ int  drill_check(DrillState *ds, const char *actual);
 /* Record attempt result (call after drill_check). */
 void drill_record_attempt(DrillState *ds, int correct);
 
+/* Return top-N highest-weight eligible sentences (deterministic, no randomness).
+ * Excludes exclude_idx. Writes indices to out_indices. Returns count written. */
+int  drill_peek_next(const DrillState *ds, int exclude_idx,
+                     int *out_indices, int max_out);
+
 #endif /* DRILL_H */

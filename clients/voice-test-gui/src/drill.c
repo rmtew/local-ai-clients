@@ -426,3 +426,59 @@ void drill_record_attempt(DrillState *ds, int correct)
     ds->session_attempts++;
     if (correct) ds->session_correct++;
 }
+
+int drill_peek_next(const DrillState *ds, int exclude_idx,
+                    int *out_indices, int max_out)
+{
+    if (ds->num_sentences == 0 || max_out <= 0) return 0;
+
+    /* Build eligible list with weights (same logic as drill_advance) */
+    int eligible[DRILL_MAX_SENTENCES];
+    double weights[DRILL_MAX_SENTENCES];
+    int num_eligible = 0;
+
+    for (int i = 0; i < ds->num_sentences; i++) {
+        if (ds->hsk_filter > 0 && ds->sentences[i].hsk_level != ds->hsk_filter)
+            continue;
+        if (i == exclude_idx) continue;
+
+        eligible[num_eligible] = i;
+
+        double accuracy = 0.0;
+        if (ds->progress[i].attempts > 0)
+            accuracy = (double)ds->progress[i].correct / ds->progress[i].attempts;
+
+        double w = 1.0 / (accuracy + 0.1);
+
+        if (ds->progress[i].streak >= 3) w *= 0.3;
+
+        /* Avoid-repeat penalty for current sentence */
+        if (i == ds->current_idx) w *= 0.01;
+
+        weights[num_eligible] = w;
+        num_eligible++;
+    }
+
+    /* Selection sort: pick top max_out by weight (descending) */
+    int count = num_eligible < max_out ? num_eligible : max_out;
+    for (int picked = 0; picked < count; picked++) {
+        int best = picked;
+        for (int j = picked + 1; j < num_eligible; j++) {
+            if (weights[j] > weights[best])
+                best = j;
+        }
+        if (best != picked) {
+            /* Swap eligible indices */
+            int tmp_idx = eligible[picked];
+            eligible[picked] = eligible[best];
+            eligible[best] = tmp_idx;
+            /* Swap weights */
+            double tmp_w = weights[picked];
+            weights[picked] = weights[best];
+            weights[best] = tmp_w;
+        }
+        out_indices[picked] = eligible[picked];
+    }
+
+    return count;
+}
