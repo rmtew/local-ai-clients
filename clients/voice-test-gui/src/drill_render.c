@@ -116,6 +116,86 @@ static void drill_draw_indicator(HDC hdc, RECT *cell, COLORREF color)
     DeleteObject(br);
 }
 
+/* ---- Word group mapping (from TTS timestamps) ---- */
+
+#define WORD_GAP_PX  8
+
+/* Map stripped target codepoints to word group indices using TTS timestamps.
+ * group_of[i] = group index for target codepoint i.
+ * Returns number of groups, or 0 if no timestamp data (all group_of = 0). */
+static int map_chars_to_word_groups(const int *cps, int n_cps,
+                                     const TtsTimestamps *ts, int *group_of,
+                                     int *group_start_ms, int *group_end_ms)
+{
+    /* Default: all characters in group 0 */
+    for (int i = 0; i < n_cps; i++) group_of[i] = 0;
+    if (!ts || !ts->words || ts->count <= 0) return 0;
+
+    int cp_idx = 0;  /* position in target codepoints */
+    int n_groups = 0;
+
+    for (int w = 0; w < ts->count && cp_idx < n_cps; w++) {
+        /* Decode this word's UTF-8 to codepoints and strip punctuation */
+        int word_cps[64];
+        int word_n = utf8_to_codepoints(ts->words[w].word, word_cps, 64);
+        word_n = strip_codepoints(word_cps, word_n);
+        if (word_n <= 0) continue;
+
+        /* Match word codepoints against target codepoints at cp_idx */
+        int matched = 0;
+        for (int j = 0; j < word_n && cp_idx + j < n_cps; j++) {
+            if (cps[cp_idx + j] == word_cps[j]) {
+                matched++;
+            } else {
+                break;
+            }
+        }
+
+        if (matched == word_n) {
+            /* Full match: assign this group */
+            for (int j = 0; j < matched; j++) {
+                group_of[cp_idx + j] = n_groups;
+            }
+            if (group_start_ms) group_start_ms[n_groups] = ts->words[w].start_ms;
+            if (group_end_ms)   group_end_ms[n_groups]   = ts->words[w].end_ms;
+            cp_idx += matched;
+            n_groups++;
+        } else if (matched > 0) {
+            /* Partial match: assign and advance */
+            for (int j = 0; j < matched; j++) {
+                group_of[cp_idx + j] = n_groups;
+            }
+            if (group_start_ms) group_start_ms[n_groups] = ts->words[w].start_ms;
+            if (group_end_ms)   group_end_ms[n_groups]   = ts->words[w].end_ms;
+            cp_idx += matched;
+            n_groups++;
+        }
+    }
+
+    /* Assign remaining unmatched codepoints to their own group */
+    for (int i = cp_idx; i < n_cps; i++) {
+        group_of[i] = n_groups;
+    }
+
+    return n_groups;
+}
+
+/* Compute per-character X positions with word group gaps.
+ * char_x[i] = left X of cell i. Returns total width. */
+static int compute_char_positions(int n, int cell_w, const int *group_of,
+                                   int n_groups, int *char_x)
+{
+    int x = 0;
+    for (int i = 0; i < n; i++) {
+        if (i > 0 && n_groups > 0 && group_of[i] != group_of[i - 1]) {
+            x += WORD_GAP_PX;
+        }
+        char_x[i] = x;
+        x += cell_w;
+    }
+    return x; /* total width */
+}
+
 /* Color for a timing delta (ms between consecutive chars) */
 static COLORREF drill_time_color(int delta_ms)
 {
@@ -126,9 +206,10 @@ static COLORREF drill_time_color(int delta_ms)
 
 /* Draw timing bars and duration labels for a row of characters.
  * ms[] has timing for each position, n = count.
+ * char_x[] has per-character left X positions.
  * Returns vertical space consumed (y advance). */
 static int drill_render_timing(HDC hdc, int *ms, int n,
-                               int start_x, int cell_w, int y, int w)
+                               const int *char_x, int cell_w, int y, int w)
 {
     if (n < 2) return 0;
     (void)w;
@@ -152,7 +233,7 @@ static int drill_render_timing(HDC hdc, int *ms, int n,
         int bar_w = (max_delta > 0) ? (delta * (cell_w - 4)) / max_delta : 0;
         if (bar_w < 2 && delta > 0) bar_w = 2;
 
-        int cx = start_x + i * cell_w + cell_w / 2;
+        int cx = char_x[i] + cell_w / 2;
         RECT bar_rc = { cx - bar_w / 2, y_bar, cx + bar_w / 2, y_bar + DRILL_TIMEBAR_H };
 
         COLORREF col = drill_time_color(delta);
@@ -164,8 +245,8 @@ static int drill_render_timing(HDC hdc, int *ms, int n,
         if (delta >= DRILL_HESITATE_MS) {
             HPEN pen = CreatePen(PS_SOLID, 2, DRILL_COLOR_HESITATE);
             HPEN old_pen = (HPEN)SelectObject(hdc, pen);
-            RECT highlight = { start_x + i * cell_w + 1, y_bar - 1,
-                               start_x + (i + 1) * cell_w - 1, y_bar + DRILL_TIMEBAR_H + 1 };
+            RECT highlight = { char_x[i] + 1, y_bar - 1,
+                               char_x[i] + cell_w - 1, y_bar + DRILL_TIMEBAR_H + 1 };
             HBRUSH null_br = (HBRUSH)GetStockObject(NULL_BRUSH);
             SelectObject(hdc, null_br);
             Rectangle(hdc, highlight.left, highlight.top, highlight.right, highlight.bottom);
@@ -184,8 +265,8 @@ static int drill_render_timing(HDC hdc, int *ms, int n,
         if (delta < 0) delta = 0;
         char label[16];
         snprintf(label, sizeof(label), "%dms", delta);
-        RECT lrc = { start_x + i * cell_w, y_labels,
-                     start_x + (i + 1) * cell_w, y_labels + 14 };
+        RECT lrc = { char_x[i], y_labels,
+                     char_x[i] + cell_w, y_labels + 14 };
         DrawTextA(hdc, label, -1, &lrc, DT_CENTER | DT_SINGLELINE);
     }
 
@@ -253,6 +334,20 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             y += 24;
         }
 
+        /* Prefetch progress indicator (top-right) */
+        {
+            LONG pf_done  = InterlockedCompareExchange(&g_tts_prefetch_done, 0, 0);
+            LONG pf_total = InterlockedCompareExchange(&g_tts_prefetch_total, 0, 0);
+            if (pf_total > 0 && pf_done < pf_total) {
+                char pf_buf[32];
+                snprintf(pf_buf, sizeof(pf_buf), "Caching: %ld/%ld", pf_done, pf_total);
+                SelectObject(hdc, g_font_small);
+                SetTextColor(hdc, RGB(120, 120, 140));
+                RECT pf_rc = { w - 150, 8, w - margin, 22 };
+                DrawTextA(hdc, pf_buf, -1, &pf_rc, DT_RIGHT | DT_SINGLELINE);
+            }
+        }
+
         /* Extract target codepoints (strip punctuation) */
         int target_cps[DRILL_MAX_TEXT];
         int num_target = utf8_to_codepoints(sent->chinese, target_cps, DRILL_MAX_TEXT);
@@ -265,6 +360,29 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         int cell_w = char_size.cx + 6;
         int cell_h = char_size.cy + 4;
 
+        /* Snapshot word timestamps under lock */
+        EnterCriticalSection(&g_tts_current_ts_lock);
+        TtsTimestamps ts_snap = {0};
+        if (g_tts_current_ts.count > 0 && g_tts_current_ts.words) {
+            ts_snap.count = g_tts_current_ts.count;
+            ts_snap.words = (TtsWordTimestamp *)malloc(
+                ts_snap.count * sizeof(TtsWordTimestamp));
+            if (ts_snap.words)
+                memcpy(ts_snap.words, g_tts_current_ts.words,
+                       ts_snap.count * sizeof(TtsWordTimestamp));
+            else
+                ts_snap.count = 0;
+        }
+        LeaveCriticalSection(&g_tts_current_ts_lock);
+
+        /* Word group mapping from TTS timestamps */
+        int group_of[DRILL_MAX_TEXT] = {0};
+        int grp_start[DRILL_MAX_TEXT] = {0};
+        int grp_end[DRILL_MAX_TEXT] = {0};
+        int n_groups = map_chars_to_word_groups(target_cps, num_target,
+                                                 &ts_snap, group_of,
+                                                 grp_start, grp_end);
+
         /* Determine how many cells (target + possible excess from result) */
         int num_result_extra = 0;
         if (g_drill_state.has_result && diff->num_actual > num_target)
@@ -273,20 +391,72 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             num_result_extra = g_drill_stream_len - num_target;
         int total_cols = num_target + num_result_extra;
 
-        int total_w = total_cols * cell_w;
+        /* Extend group_of for extra result columns (each in its own group) */
+        for (int i = num_target; i < total_cols; i++) {
+            group_of[i] = (n_groups > 0 ? n_groups : 0) + (i - num_target);
+        }
+
+        /* Compute per-character X positions with word group gaps */
+        int char_x[DRILL_MAX_TEXT];
+        int total_w = compute_char_positions(total_cols, cell_w, group_of,
+                                              n_groups, char_x);
         int start_x = (w - total_w) / 2;
         if (start_x < margin) start_x = margin;
+
+        /* Offset all char_x by start_x */
+        for (int i = 0; i < total_cols; i++) char_x[i] += start_x;
 
         /* Row 1: Target characters (large font, white) */
         s_target_y_top = y;
         SelectObject(hdc, g_font_drill_chinese);
         for (int i = 0; i < num_target; i++) {
-            RECT cell = { start_x + i * cell_w, y,
-                          start_x + (i + 1) * cell_w, y + cell_h };
+            RECT cell = { char_x[i], y,
+                          char_x[i] + cell_w, y + cell_h };
             drill_draw_cp(hdc, target_cps[i], &cell, DRILL_COLOR_TEXT);
+
+            /* Draw subtle word boundary separator */
+            if (n_groups > 0 && i > 0 && group_of[i] != group_of[i - 1]) {
+                int sep_x = (char_x[i - 1] + cell_w + char_x[i]) / 2;
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(70, 70, 80));
+                HPEN old_pen = (HPEN)SelectObject(hdc, pen);
+                MoveToEx(hdc, sep_x, y + 4, NULL);
+                LineTo(hdc, sep_x, y + cell_h - 4);
+                SelectObject(hdc, old_pen);
+                DeleteObject(pen);
+            }
         }
         y += cell_h + 2;
         s_target_y_bot = y;
+
+        /* Playback highlight — underline current/spoken words during TTS playback */
+        {
+            LONG pb_ms = InterlockedCompareExchange(&g_tts_playback_ms, 0, 0);
+            if (pb_ms >= 0 && n_groups > 0) {
+                HBRUSH br_cur  = CreateSolidBrush(RGB(80, 160, 255));
+                HBRUSH br_done = CreateSolidBrush(RGB(50, 70, 100));
+                for (int i = 0; i < num_target; i++) {
+                    int g = group_of[i];
+                    if (g >= n_groups) continue;  /* no timestamp for this group */
+                    int gs = grp_start[g], ge = grp_end[g];
+                    HBRUSH br;
+                    int bar_h;
+                    if (pb_ms >= gs && pb_ms < ge) {
+                        br = br_cur;   /* current word — bright blue */
+                        bar_h = 3;
+                    } else if (pb_ms >= ge) {
+                        br = br_done;  /* already spoken — dim */
+                        bar_h = 2;
+                    } else {
+                        continue;      /* not yet spoken */
+                    }
+                    RECT bar = { char_x[i], y - 2 - bar_h,
+                                 char_x[i] + cell_w, y - 2 };
+                    FillRect(hdc, &bar, br);
+                }
+                DeleteObject(br_cur);
+                DeleteObject(br_done);
+            }
+        }
 
         /* Copy flash overlay for target row */
         if (g_drill_copy_row == 0) {
@@ -328,8 +498,8 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             SelectObject(hdc, g_font_drill_chinese);
 
             for (int i = 0; i < result_cols; i++) {
-                RECT cell = { start_x + i * cell_w, y,
-                              start_x + (i + 1) * cell_w, y + cell_h };
+                RECT cell = { char_x[i], y,
+                              char_x[i] + cell_w, y + cell_h };
 
                 if (phase == 4) {
                     /* Final result: colored background + character */
@@ -404,7 +574,7 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         /* Timing visualization (bars + duration labels) */
         if (has_timing && timing_n >= 2 && (phase == 3 || phase == 4)) {
             y += drill_render_timing(hdc, g_drill_stream_ms, timing_n,
-                                     start_x, cell_w, y, w);
+                                     char_x, cell_w, y, w);
         }
 
         /* Pinyin */
@@ -504,6 +674,8 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 DrawTextA(hdc, sprog, -1, &sp_rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
         }
+
+        free(ts_snap.words);
 
 paint_done:
         /* Blit to screen */

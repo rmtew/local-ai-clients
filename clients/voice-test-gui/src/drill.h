@@ -47,7 +47,15 @@ typedef struct {
     int  hsk_filter;                    /* 0=all, 1-3=specific level */
 } DrillState;
 
-/* Load sentence bank from pipe-delimited file. Returns 0 on success. */
+/* Load sentence bank from pipe-delimited file. Returns 0 on success.
+ * Zeroes the entire DrillState first; safe to call before drill_init_game. */
+int  drill_load_bank(DrillState *ds, const char *sentence_file);
+
+/* Reset session state and load saved progress.  Requires a prior drill_load_bank
+ * so that the sentence array is populated.  Returns 0 on success. */
+int  drill_init_game(DrillState *ds, const char *progress_file);
+
+/* Combined convenience: drill_load_bank + drill_init_game. Returns 0 on success. */
 int  drill_init(DrillState *ds, const char *sentence_file, const char *progress_file);
 
 /* Save progress and clean up. */

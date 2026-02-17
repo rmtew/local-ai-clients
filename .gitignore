@@ -5,3 +5,4 @@ bin/
 *.pdb
 *.ilk
 *.log
+tts_cache/

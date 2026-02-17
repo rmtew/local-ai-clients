@@ -291,19 +291,35 @@ static void drill_save_progress(DrillState *ds, const char *filepath)
 
 /* ---------- Public API ---------- */
 
-int drill_init(DrillState *ds, const char *sentence_file, const char *progress_file)
+int drill_load_bank(DrillState *ds, const char *sentence_file)
 {
     memset(ds, 0, sizeof(*ds));
     ds->current_idx = -1;
     ds->hsk_filter = 0;  /* all levels */
+    return drill_load_sentences(ds, sentence_file);
+}
 
-    int rc = drill_load_sentences(ds, sentence_file);
-    if (rc != 0) return rc;
+int drill_init_game(DrillState *ds, const char *progress_file)
+{
+    ds->current_idx = -1;
+    ds->session_attempts = 0;
+    ds->session_correct = 0;
+    ds->has_result = 0;
+    ds->result_text[0] = '\0';
+    memset(&ds->last_diff, 0, sizeof(ds->last_diff));
+    memset(ds->progress, 0, sizeof(ds->progress));
 
     if (progress_file)
         drill_load_progress(ds, progress_file);
 
     return 0;
+}
+
+int drill_init(DrillState *ds, const char *sentence_file, const char *progress_file)
+{
+    int rc = drill_load_bank(ds, sentence_file);
+    if (rc != 0) return rc;
+    return drill_init_game(ds, progress_file);
 }
 
 void drill_shutdown(DrillState *ds, const char *progress_file)

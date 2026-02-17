@@ -170,6 +170,7 @@ static DWORD g_drill_copy_tick = 0;   /* GetTickCount() of last copy */
 static int   g_drill_copy_row = -1;   /* 0=target, 1=result */
 #define DRILL_COPY_FLASH_MS 800
 #define ID_TIMER_DRILL_COPY 43
+#define ID_TIMER_PLAYBACK   44
 
 /* TTS state */
 static ISpVoice *g_tts_voice = NULL;
@@ -180,6 +181,8 @@ static int g_tts_enabled = 1;
 #define TTS_RESPONSE_BUF (4 * 1024 * 1024)  /* 4 MB for WAV data */
 static HWAVEOUT g_waveout = NULL;
 static HANDLE g_waveout_done_event = NULL;
+static int           g_waveout_sr = 0;          /* sample rate of current playback */
+static volatile LONG g_tts_playback_ms = -1;    /* -1 = not playing, >=0 = position ms */
 static volatile LONG g_tts_interrupt = 0;
 static volatile HINTERNET g_tts_worker_hrequest = NULL;  /* in-flight HTTP for cancellation */
 static char *g_tts_pending_text = NULL;
@@ -199,28 +202,43 @@ static const char *g_tts_voices[] = {
 #define TTS_NUM_VOICES (sizeof(g_tts_voices) / sizeof(g_tts_voices[0]))
 static int g_tts_voice_idx = 0;  /* Vivian default */
 
-/* TTS pre-fetch cache */
-#define TTS_CACHE_SIZE 3
+/* TTS word timestamps (from ASR on generated audio) */
+typedef struct {
+    char word[64];    /* UTF-8 word text */
+    int  start_ms;
+    int  end_ms;
+} TtsWordTimestamp;
 
 typedef struct {
-    int   sentence_idx;  /* -1 = empty */
-    int   voice_idx;
-    char *wav_data;      /* malloc'd WAV bytes */
-    int   wav_len;
-} TtsCacheEntry;
+    TtsWordTimestamp *words;  /* malloc'd, NULL if none */
+    int              count;
+} TtsTimestamps;
 
-static TtsCacheEntry    g_tts_cache[TTS_CACHE_SIZE];
-static CRITICAL_SECTION g_tts_cache_lock;
+/* Per-sentence TTS+ASR drill cache (non-destructive reads) */
+typedef struct {
+    char *wav_data;           /* malloc'd, NULL = empty */
+    int   wav_len;
+    TtsTimestamps timestamps;
+} TtsDrillCacheEntry;
+
+static TtsDrillCacheEntry *g_tts_drill_cache       = NULL;  /* malloc'd [num_sentences] */
+static int                  g_tts_drill_cache_count = 0;
+static int                  g_tts_drill_cache_voice = -1;
+static CRITICAL_SECTION     g_tts_drill_cache_lock;
+
+/* Current word timestamps (set by worker thread, read by drill renderer) */
+static TtsTimestamps    g_tts_current_ts = {0};
+static CRITICAL_SECTION g_tts_current_ts_lock;
 
 /* TTS pre-fetch thread */
 static HANDLE           g_tts_prefetch_event     = NULL;  /* auto-reset */
 static HANDLE           g_tts_prefetch_shutdown   = NULL;  /* manual-reset */
 static HANDLE           g_tts_prefetch_thread     = NULL;
-static volatile LONG    g_tts_prefetch_cancel     = 0;
 static volatile HINTERNET g_tts_prefetch_hrequest = NULL;  /* in-flight HTTP for cancellation */
-static int              g_tts_prefetch_targets[TTS_CACHE_SIZE]; /* desired sentence indices */
-static int              g_tts_prefetch_voice_idx  = 0;
-static CRITICAL_SECTION g_tts_prefetch_lock;  /* protects targets + voice_idx */
+static volatile LONG    g_tts_prefetch_priority   = -1;    /* sentence to fetch next */
+static volatile LONG    g_tts_prefetch_voice_gen  = 0;     /* incremented on voice change */
+static volatile LONG    g_tts_prefetch_done       = 0;     /* completed count for progress UI */
+static volatile LONG    g_tts_prefetch_total      = 0;     /* total sentences for progress UI */
 
 /* System/hardware info (queried once at startup) */
 static char g_os_version[64] = "";
@@ -450,6 +468,7 @@ static int waveout_open(int sample_rate) {
         return 0;
     }
 
+    g_waveout_sr = sample_rate;
     log_event("WAVEOUT", "Opened successfully");
     return 1;
 }
@@ -480,8 +499,10 @@ static int waveout_play_pcm(const int16_t *samples, int n_samples) {
     if (mr != MMSYSERR_NOERROR) return 0;
 
     ResetEvent(g_waveout_done_event);
+    InterlockedExchange(&g_tts_playback_ms, 0);
     mr = waveOutWrite(g_waveout, &hdr, sizeof(hdr));
     if (mr != MMSYSERR_NOERROR) {
+        InterlockedExchange(&g_tts_playback_ms, -1);
         waveOutUnprepareHeader(g_waveout, &hdr, sizeof(hdr));
         return 0;
     }
@@ -495,24 +516,220 @@ static int waveout_play_pcm(const int16_t *samples, int n_samples) {
                 interrupted = 1;
                 break;
             }
+            /* Update playback position for karaoke highlight */
+            if (g_waveout_sr > 0) {
+                MMTIME mmt = {0};
+                mmt.wType = TIME_SAMPLES;
+                if (waveOutGetPosition(g_waveout, &mmt, sizeof(mmt)) == MMSYSERR_NOERROR
+                    && mmt.wType == TIME_SAMPLES) {
+                    InterlockedExchange(&g_tts_playback_ms,
+                        (LONG)((double)mmt.u.sample * 1000.0 / g_waveout_sr));
+                }
+            }
         }
     }
 
+    InterlockedExchange(&g_tts_playback_ms, -1);
     waveOutUnprepareHeader(g_waveout, &hdr, sizeof(hdr));
     return interrupted;
+}
+
+/* ---- Base64 decoder (for TTS timestamp responses) ---- */
+
+static const int b64_decode_table[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
+
+static char *base64_decode(const char *b64, int b64_len, int *out_len) {
+    *out_len = 0;
+    int pad = 0;
+    if (b64_len >= 1 && b64[b64_len - 1] == '=') pad++;
+    if (b64_len >= 2 && b64[b64_len - 2] == '=') pad++;
+    int out_size = (b64_len / 4) * 3 - pad;
+    if (out_size <= 0) return NULL;
+    char *out = (char *)malloc(out_size);
+    if (!out) return NULL;
+
+    int j = 0;
+    for (int i = 0; i + 3 < b64_len; i += 4) {
+        int a = b64_decode_table[(unsigned char)b64[i]];
+        int b = b64_decode_table[(unsigned char)b64[i+1]];
+        int c = b64_decode_table[(unsigned char)b64[i+2]];
+        int d = b64_decode_table[(unsigned char)b64[i+3]];
+        if (a < 0 || b < 0) { free(out); return NULL; }
+        int v = (a << 18) | (b << 12);
+        if (c >= 0) v |= (c << 6);
+        if (d >= 0) v |= d;
+        if (j < out_size) out[j++] = (char)((v >> 16) & 0xFF);
+        if (j < out_size && c >= 0) out[j++] = (char)((v >> 8) & 0xFF);
+        if (j < out_size && d >= 0) out[j++] = (char)(v & 0xFF);
+    }
+    *out_len = j;
+    return out;
+}
+
+/* ---- TTS timestamp JSON parser ---- */
+
+/* Safe strnstr for non-null-terminated buffers */
+static const char *strnstr_safe(const char *haystack, const char *needle, int haystack_len) {
+    int needle_len = (int)strlen(needle);
+    for (int i = 0; i <= haystack_len - needle_len; i++) {
+        if (memcmp(haystack + i, needle, needle_len) == 0)
+            return haystack + i;
+    }
+    return NULL;
+}
+
+/* Find a JSON string field value. Returns pointer to the opening quote content,
+ * sets *value_len to content length (between quotes). Returns NULL if not found. */
+static const char *json_find_string(const char *json, int json_len,
+                                     const char *key, int *value_len) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strnstr_safe(json, pattern, json_len);
+    if (!p) return NULL;
+    p += strlen(pattern);
+    while (p < json + json_len && (*p == ' ' || *p == '\t')) p++;
+    if (p >= json + json_len || *p != '"') return NULL;
+    p++; /* skip opening quote */
+    const char *start = p;
+    while (p < json + json_len && *p != '"') {
+        if (*p == '\\') p++; /* skip escaped char */
+        p++;
+    }
+    *value_len = (int)(p - start);
+    return start;
+}
+
+static double json_find_double(const char *json, int json_len,
+                                const char *key, double fallback) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strnstr_safe(json, pattern, json_len);
+    if (!p) return fallback;
+    p += strlen(pattern);
+    while (p < json + json_len && (*p == ' ' || *p == '\t')) p++;
+    int remaining = (int)(json + json_len - p);
+    if (remaining <= 0) return fallback;
+    char tmp[64];
+    if (remaining > 63) remaining = 63;
+    memcpy(tmp, p, remaining);
+    tmp[remaining] = '\0';
+    return atof(tmp);
+}
+
+/* Parse TTS timestamp JSON response.
+ * Returns 0 on success, -1 on error. Caller must free *wav_out. */
+static int tts_parse_timestamp_response(const char *json, int json_len,
+                                         char **wav_out, int *wav_len_out,
+                                         TtsTimestamps *ts_out) {
+    *wav_out = NULL;
+    *wav_len_out = 0;
+    ts_out->words = NULL;
+    ts_out->count = 0;
+
+    /* Extract "audio":"<base64>" */
+    int audio_b64_len = 0;
+    const char *audio_b64 = json_find_string(json, json_len, "audio", &audio_b64_len);
+    if (!audio_b64 || audio_b64_len <= 0) return -1;
+
+    int wav_len = 0;
+    char *wav = base64_decode(audio_b64, audio_b64_len, &wav_len);
+    if (!wav || wav_len <= 0) return -1;
+
+    *wav_out = wav;
+    *wav_len_out = wav_len;
+
+    /* Parse "words":[...] array */
+    const char *words_key = strnstr_safe(json, "\"words\":", json_len);
+    if (!words_key) return 0; /* no words array is OK */
+
+    const char *arr_start = strchr(words_key, '[');
+    if (!arr_start) return 0;
+    arr_start++;
+
+    /* Count objects to allocate */
+    int count = 0;
+    {
+        const char *scan = arr_start;
+        const char *end = json + json_len;
+        while (scan < end && *scan != ']') {
+            if (*scan == '{') count++;
+            scan++;
+        }
+    }
+    if (count <= 0) return 0;
+
+    TtsWordTimestamp *words = (TtsWordTimestamp *)calloc(count, sizeof(TtsWordTimestamp));
+    if (!words) return 0;
+
+    /* Parse each word object */
+    const char *p = arr_start;
+    const char *end = json + json_len;
+    for (int i = 0; i < count && p < end; i++) {
+        /* Find next '{' */
+        while (p < end && *p != '{') p++;
+        if (p >= end) break;
+
+        /* Find matching '}' */
+        const char *obj_start = p;
+        const char *obj_end = strchr(p, '}');
+        if (!obj_end) break;
+        int obj_len = (int)(obj_end - obj_start + 1);
+
+        /* Extract "word" */
+        int wlen = 0;
+        const char *wval = json_find_string(obj_start, obj_len, "word", &wlen);
+        if (wval && wlen > 0) {
+            int copy_len = wlen < 63 ? wlen : 63;
+            memcpy(words[i].word, wval, copy_len);
+            words[i].word[copy_len] = '\0';
+        }
+
+        /* Extract "start" and "end" as seconds, convert to ms */
+        double start_s = json_find_double(obj_start, obj_len, "start", 0.0);
+        double end_s = json_find_double(obj_start, obj_len, "end", 0.0);
+        words[i].start_ms = (int)(start_s * 1000.0);
+        words[i].end_ms = (int)(end_s * 1000.0);
+
+        p = obj_end + 1;
+    }
+
+    ts_out->words = words;
+    ts_out->count = count;
+    return 0;
 }
 
 /* ---- TTS HTTP client (local-ai-server /v1/audio/speech) ---- */
 
 /* POST to TTS server, receive WAV bytes. Returns 0 on success, -1 on failure.
  * Caller must free *wav_out.
+ * ts_out (optional): when non-NULL, sends "timestamps":true, parses JSON response
+ * to extract WAV + word timestamps. When NULL, receives raw WAV bytes.
  * cancel_handle (optional): published for external cancellation via
  * WinHttpCloseHandle from another thread. InterlockedExchangePointer ensures
  * exactly one side (caller or canceller) closes the request handle. */
 static int tts_request(const char *text, const char *voice, char **wav_out, int *wav_len,
+                       TtsTimestamps *ts_out,
                        volatile HINTERNET *cancel_handle) {
     *wav_out = NULL;
     *wav_len = 0;
+    if (ts_out) { ts_out->words = NULL; ts_out->count = 0; }
 
     HINTERNET hSession = WinHttpOpen(L"VoiceNoteGUI/1.0",
                                       WINHTTP_ACCESS_TYPE_NO_PROXY,
@@ -544,13 +761,19 @@ static int tts_request(const char *text, const char *voice, char **wav_out, int 
     /* 5s connect, 60s receive (TTS generation can be slow) */
     WinHttpSetTimeouts(hRequest, 5000, 5000, 60000, 60000);
 
-    /* Build JSON body: {"input":"<text>","voice":"<name>","response_format":"wav"} */
+    /* Build JSON body */
     char escaped[4096];
     json_escape(text, escaped, sizeof(escaped));
     char body[8192];
-    snprintf(body, sizeof(body),
-             "{\"input\":\"%s\",\"voice\":\"%s\",\"response_format\":\"wav\"}",
-             escaped, voice);
+    if (ts_out) {
+        snprintf(body, sizeof(body),
+                 "{\"input\":\"%s\",\"voice\":\"%s\",\"response_format\":\"wav\",\"timestamps\":true,\"language\":\"Chinese\"}",
+                 escaped, voice);
+    } else {
+        snprintf(body, sizeof(body),
+                 "{\"input\":\"%s\",\"voice\":\"%s\",\"response_format\":\"wav\"}",
+                 escaped, voice);
+    }
 
     DWORD body_len = (DWORD)strlen(body);
     BOOL ok = WinHttpSendRequest(hRequest,
@@ -572,7 +795,7 @@ static int tts_request(const char *text, const char *voice, char **wav_out, int 
             snprintf(errmsg, sizeof(errmsg), "TTS server returned HTTP %lu", status_code);
             log_event("TTS_SRV", errmsg);
         } else {
-            /* Read WAV data */
+            /* Read response data */
             char *buf = (char *)malloc(TTS_RESPONSE_BUF);
             if (buf) {
                 DWORD total = 0, bytes_read = 0;
@@ -583,9 +806,18 @@ static int tts_request(const char *text, const char *voice, char **wav_out, int 
                     if (total >= (DWORD)TTS_RESPONSE_BUF) break;
                 }
                 if (total > 0) {
-                    *wav_out = buf;
-                    *wav_len = (int)total;
-                    result = 0;
+                    if (ts_out) {
+                        /* JSON response: parse base64 audio + word timestamps */
+                        int rc = tts_parse_timestamp_response(buf, (int)total,
+                                                               wav_out, wav_len, ts_out);
+                        free(buf);
+                        if (rc == 0 && *wav_out) result = 0;
+                    } else {
+                        /* Raw WAV response */
+                        *wav_out = buf;
+                        *wav_len = (int)total;
+                        result = 0;
+                    }
                 } else {
                     free(buf);
                 }
@@ -644,120 +876,227 @@ static int wav_parse_header(const char *wav_data, int wav_len,
     return -1;
 }
 
-/* ---- TTS pre-fetch cache ---- */
+/* ---- Per-sentence TTS drill cache ---- */
 
-/* Returns 1 on hit, removes entry. Caller owns returned wav data. */
-static int tts_cache_take(int sentence_idx, int voice_idx, char **wav, int *len) {
-    int found = 0;
-    EnterCriticalSection(&g_tts_cache_lock);
-    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
-        if (g_tts_cache[i].sentence_idx == sentence_idx
-            && g_tts_cache[i].voice_idx == voice_idx) {
-            *wav = g_tts_cache[i].wav_data;
-            *len = g_tts_cache[i].wav_len;
-            g_tts_cache[i].sentence_idx = -1;
-            g_tts_cache[i].wav_data = NULL;
-            g_tts_cache[i].wav_len = 0;
-            found = 1;
-            break;
-        }
+static void tts_drill_cache_init(int n) {
+    InitializeCriticalSection(&g_tts_drill_cache_lock);
+    g_tts_drill_cache = (TtsDrillCacheEntry *)calloc(n, sizeof(TtsDrillCacheEntry));
+    g_tts_drill_cache_count = n;
+}
+
+static void tts_drill_cache_destroy(void) {
+    if (!g_tts_drill_cache) return;  /* init was never called */
+    for (int i = 0; i < g_tts_drill_cache_count; i++) {
+        free(g_tts_drill_cache[i].wav_data);
+        free(g_tts_drill_cache[i].timestamps.words);
     }
-    LeaveCriticalSection(&g_tts_cache_lock);
+    free(g_tts_drill_cache);
+    g_tts_drill_cache = NULL;
+    g_tts_drill_cache_count = 0;
+    DeleteCriticalSection(&g_tts_drill_cache_lock);
+}
+
+static void tts_drill_cache_clear(void) {
+    EnterCriticalSection(&g_tts_drill_cache_lock);
+    for (int i = 0; i < g_tts_drill_cache_count; i++) {
+        free(g_tts_drill_cache[i].wav_data);
+        free(g_tts_drill_cache[i].timestamps.words);
+        g_tts_drill_cache[i].wav_data = NULL;
+        g_tts_drill_cache[i].wav_len = 0;
+        g_tts_drill_cache[i].timestamps.words = NULL;
+        g_tts_drill_cache[i].timestamps.count = 0;
+    }
+    LeaveCriticalSection(&g_tts_drill_cache_lock);
+}
+
+static int tts_drill_cache_has(int idx) {
+    if (idx < 0 || idx >= g_tts_drill_cache_count) return 0;
+    int found;
+    EnterCriticalSection(&g_tts_drill_cache_lock);
+    found = (g_tts_drill_cache[idx].wav_data != NULL) ? 1 : 0;
+    LeaveCriticalSection(&g_tts_drill_cache_lock);
     return found;
 }
 
-/* Store entry. Overwrites duplicate key, else uses empty slot, else evicts oldest. */
-static void tts_cache_put(int sentence_idx, int voice_idx, char *wav, int len) {
-    EnterCriticalSection(&g_tts_cache_lock);
-    int slot = -1;
-    /* Overwrite existing entry with same key */
-    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
-        if (g_tts_cache[i].sentence_idx == sentence_idx
-            && g_tts_cache[i].voice_idx == voice_idx) {
-            free(g_tts_cache[i].wav_data);
-            slot = i;
-            break;
-        }
-    }
-    /* Find empty slot */
-    if (slot < 0) {
-        for (int i = 0; i < TTS_CACHE_SIZE; i++) {
-            if (g_tts_cache[i].sentence_idx == -1) {
-                slot = i;
-                break;
-            }
-        }
-    }
-    /* No empty slot: evict slot 0 (oldest) */
-    if (slot < 0) {
-        free(g_tts_cache[0].wav_data);
-        for (int i = 0; i < TTS_CACHE_SIZE - 1; i++)
-            g_tts_cache[i] = g_tts_cache[i + 1];
-        slot = TTS_CACHE_SIZE - 1;
-        g_tts_cache[slot].sentence_idx = -1;
-        g_tts_cache[slot].wav_data = NULL;
-    }
-    g_tts_cache[slot].sentence_idx = sentence_idx;
-    g_tts_cache[slot].voice_idx = voice_idx;
-    g_tts_cache[slot].wav_data = wav;
-    g_tts_cache[slot].wav_len = len;
-    LeaveCriticalSection(&g_tts_cache_lock);
-}
-
-/* Free all cache entries. */
-static void tts_cache_clear(void) {
-    EnterCriticalSection(&g_tts_cache_lock);
-    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
-        free(g_tts_cache[i].wav_data);
-        g_tts_cache[i].wav_data = NULL;
-        g_tts_cache[i].wav_len = 0;
-        g_tts_cache[i].sentence_idx = -1;
-    }
-    LeaveCriticalSection(&g_tts_cache_lock);
-}
-
-/* Non-destructive check: returns 1 if entry exists in cache. */
-static int tts_cache_has(int sentence_idx, int voice_idx) {
+/* Non-destructive copy: malloc+memcpy WAV and timestamps out. Returns 1 on hit. */
+static int tts_drill_cache_copy(int idx, char **wav, int *len, TtsTimestamps *ts) {
+    if (idx < 0 || idx >= g_tts_drill_cache_count) return 0;
     int found = 0;
-    EnterCriticalSection(&g_tts_cache_lock);
-    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
-        if (g_tts_cache[i].sentence_idx == sentence_idx
-            && g_tts_cache[i].voice_idx == voice_idx) {
+    EnterCriticalSection(&g_tts_drill_cache_lock);
+    TtsDrillCacheEntry *e = &g_tts_drill_cache[idx];
+    if (e->wav_data) {
+        *wav = (char *)malloc(e->wav_len);
+        if (*wav) {
+            memcpy(*wav, e->wav_data, e->wav_len);
+            *len = e->wav_len;
+            if (ts) {
+                ts->count = e->timestamps.count;
+                if (e->timestamps.count > 0 && e->timestamps.words) {
+                    ts->words = (TtsWordTimestamp *)malloc(
+                        e->timestamps.count * sizeof(TtsWordTimestamp));
+                    if (ts->words)
+                        memcpy(ts->words, e->timestamps.words,
+                               e->timestamps.count * sizeof(TtsWordTimestamp));
+                    else
+                        ts->count = 0;
+                } else {
+                    ts->words = NULL;
+                    ts->count = 0;
+                }
+            }
             found = 1;
-            break;
         }
     }
-    LeaveCriticalSection(&g_tts_cache_lock);
+    LeaveCriticalSection(&g_tts_drill_cache_lock);
     return found;
 }
 
-/* Evict entries that don't match voice_idx or aren't in the keep list. */
-static void tts_cache_evict_stale(int voice_idx, const int *keep, int keep_count) {
-    EnterCriticalSection(&g_tts_cache_lock);
-    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
-        if (g_tts_cache[i].sentence_idx < 0) continue;
-        if (g_tts_cache[i].voice_idx != voice_idx) {
-            free(g_tts_cache[i].wav_data);
-            g_tts_cache[i].wav_data = NULL;
-            g_tts_cache[i].wav_len = 0;
-            g_tts_cache[i].sentence_idx = -1;
-            continue;
+/* Copy timestamps only (skip ~200 KB WAV memcpy). Returns 1 on hit. */
+static int tts_drill_cache_copy_ts(int idx, TtsTimestamps *ts) {
+    if (idx < 0 || idx >= g_tts_drill_cache_count || !ts) return 0;
+    int found = 0;
+    EnterCriticalSection(&g_tts_drill_cache_lock);
+    TtsDrillCacheEntry *e = &g_tts_drill_cache[idx];
+    if (e->wav_data) {
+        ts->count = e->timestamps.count;
+        if (e->timestamps.count > 0 && e->timestamps.words) {
+            ts->words = (TtsWordTimestamp *)malloc(
+                e->timestamps.count * sizeof(TtsWordTimestamp));
+            if (ts->words)
+                memcpy(ts->words, e->timestamps.words,
+                       e->timestamps.count * sizeof(TtsWordTimestamp));
+            else
+                ts->count = 0;
+        } else {
+            ts->words = NULL;
+            ts->count = 0;
         }
-        int stale = 1;
-        for (int j = 0; j < keep_count; j++) {
-            if (keep[j] == g_tts_cache[i].sentence_idx) {
-                stale = 0;
-                break;
+        found = 1;
+    }
+    LeaveCriticalSection(&g_tts_drill_cache_lock);
+    return found;
+}
+
+/* Store entry (takes ownership of wav; copies timestamps). */
+static void tts_drill_cache_put(int idx, char *wav, int len, TtsTimestamps *ts) {
+    if (idx < 0 || idx >= g_tts_drill_cache_count) { free(wav); return; }
+    EnterCriticalSection(&g_tts_drill_cache_lock);
+    TtsDrillCacheEntry *e = &g_tts_drill_cache[idx];
+    free(e->wav_data);
+    free(e->timestamps.words);
+    e->wav_data = wav;
+    e->wav_len = len;
+    if (ts && ts->count > 0 && ts->words) {
+        e->timestamps.count = ts->count;
+        e->timestamps.words = (TtsWordTimestamp *)malloc(
+            ts->count * sizeof(TtsWordTimestamp));
+        if (e->timestamps.words)
+            memcpy(e->timestamps.words, ts->words,
+                   ts->count * sizeof(TtsWordTimestamp));
+        else
+            e->timestamps.count = 0;
+    } else {
+        e->timestamps.words = NULL;
+        e->timestamps.count = 0;
+    }
+    LeaveCriticalSection(&g_tts_drill_cache_lock);
+}
+
+/* ---- TTS disk cache (persist WAV + timestamps across sessions) ---- */
+
+static uint32_t fnv1a(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
+    return h;
+}
+
+/* Build disk cache path: <exe_dir>\..\tts_cache\<voice>\<hash>.<ext>
+ * Creates directories if missing. Returns 0 on success. */
+static int tts_disk_cache_path(const char *voice, const char *chinese,
+                                const char *ext, char *out, int out_size) {
+    char base[MAX_PATH];
+    if (resolve_exe_relative("..\\tts_cache", base, sizeof(base)) != 0) return -1;
+    CreateDirectoryA(base, NULL);  /* tts_cache/ */
+    char voice_dir[MAX_PATH];
+    snprintf(voice_dir, sizeof(voice_dir), "%s\\%s", base, voice);
+    CreateDirectoryA(voice_dir, NULL);  /* tts_cache/<voice>/ */
+    uint32_t hash = fnv1a(chinese);
+    snprintf(out, out_size, "%s\\%08x.%s", voice_dir, hash, ext);
+    return 0;
+}
+
+static void tts_disk_cache_save(const char *voice, const char *chinese,
+                                 const char *wav, int wav_len,
+                                 const TtsTimestamps *ts) {
+    char path[MAX_PATH];
+    /* Save WAV */
+    if (tts_disk_cache_path(voice, chinese, "wav", path, sizeof(path)) != 0) return;
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(wav, 1, wav_len, f);
+    fclose(f);
+    /* Save timestamps */
+    if (ts && ts->count > 0 && ts->words) {
+        if (tts_disk_cache_path(voice, chinese, "ts", path, sizeof(path)) != 0) return;
+        f = fopen(path, "w");
+        if (!f) return;
+        for (int i = 0; i < ts->count; i++)
+            fprintf(f, "%s\t%d\t%d\n", ts->words[i].word,
+                    ts->words[i].start_ms, ts->words[i].end_ms);
+        fclose(f);
+    }
+}
+
+/* Returns 1 on hit, populates wav/len/ts (caller owns allocations). */
+static int tts_disk_cache_load(const char *voice, const char *chinese,
+                                char **wav, int *wav_len, TtsTimestamps *ts) {
+    char path[MAX_PATH];
+    if (tts_disk_cache_path(voice, chinese, "wav", path, sizeof(path)) != 0) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz <= 0) { fclose(f); return 0; }
+    fseek(f, 0, SEEK_SET);
+    *wav = (char *)malloc(sz);
+    if (!*wav) { fclose(f); return 0; }
+    size_t nread = fread(*wav, 1, sz, f);
+    fclose(f);
+    if ((long)nread != sz) { free(*wav); *wav = NULL; return 0; }
+    *wav_len = (int)sz;
+    /* Load timestamps (optional — WAV alone is still useful) */
+    ts->words = NULL;
+    ts->count = 0;
+    if (tts_disk_cache_path(voice, chinese, "ts", path, sizeof(path)) == 0) {
+        f = fopen(path, "r");
+        if (f) {
+            /* Count lines */
+            int nlines = 0;
+            char line[256];
+            while (fgets(line, sizeof(line), f)) nlines++;
+            if (nlines > 0) {
+                rewind(f);
+                ts->words = (TtsWordTimestamp *)malloc(nlines * sizeof(TtsWordTimestamp));
+                if (ts->words) {
+                    int n = 0;
+                    while (fgets(line, sizeof(line), f) && n < nlines) {
+                        char word[64] = "";
+                        int s = 0, e = 0;
+                        if (sscanf(line, "%63[^\t]\t%d\t%d", word, &s, &e) == 3) {
+                            strncpy(ts->words[n].word, word, sizeof(ts->words[n].word) - 1);
+                            ts->words[n].word[sizeof(ts->words[n].word) - 1] = '\0';
+                            ts->words[n].start_ms = s;
+                            ts->words[n].end_ms = e;
+                            n++;
+                        }
+                    }
+                    ts->count = n;
+                }
             }
-        }
-        if (stale) {
-            free(g_tts_cache[i].wav_data);
-            g_tts_cache[i].wav_data = NULL;
-            g_tts_cache[i].wav_len = 0;
-            g_tts_cache[i].sentence_idx = -1;
+            fclose(f);
         }
     }
-    LeaveCriticalSection(&g_tts_cache_lock);
+    return 1;
 }
 
 /* ---- TTS worker thread (server-based) ---- */
@@ -783,12 +1122,18 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
         /* Clear interrupt flag before request */
         InterlockedExchange(&g_tts_interrupt, 0);
 
+        /* Request timestamps in drill mode */
+        int want_ts = g_drill_mode;
+        TtsTimestamps worker_ts = {0};
+
         /* Check cache first */
         char *wav_data = NULL;
         int wav_len = 0;
         int from_cache = 0;
 
-        if (sentence_idx >= 0 && tts_cache_take(sentence_idx, voice_idx, &wav_data, &wav_len)) {
+        if (sentence_idx >= 0 && tts_drill_cache_copy(sentence_idx,
+                                                  &wav_data, &wav_len,
+                                                  want_ts ? &worker_ts : NULL)) {
             log_event("TTS_SRV", "Cache hit");
             free(text);
             from_cache = 1;
@@ -799,24 +1144,41 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
             PostMessageA(g_hwnd_main, WM_TTS_STATUS, 1, 0); /* generating */
 
             int rc = tts_request(text, g_tts_voices[voice_idx], &wav_data, &wav_len,
+                                 want_ts ? &worker_ts : NULL,
                                  &g_tts_worker_hrequest);
-            free(text);
 
             if (rc != 0 || !wav_data) {
                 log_event("TTS_SRV", "Request failed");
                 PostMessageA(g_hwnd_main, WM_TTS_STATUS, 3, 0); /* error */
+                free(text);
                 free(wav_data);
+                free(worker_ts.words);
                 continue;
             }
 
             /* Check interrupt after network request */
             if (InterlockedCompareExchange(&g_tts_interrupt, 0, 0)) {
                 log_event("TTS_SRV", "Interrupted after download");
+                free(text);
                 free(wav_data);
+                free(worker_ts.words);
                 PostMessageA(g_hwnd_main, WM_TTS_STATUS, 0, 0);
                 continue;
             }
+
+            /* Persist to disk so prefetch can load from disk instead of server */
+            if (sentence_idx >= 0) {
+                tts_disk_cache_save(g_tts_voices[voice_idx], text, wav_data, wav_len,
+                                    want_ts ? &worker_ts : NULL);
+            }
+            free(text);
         }
+
+        /* Publish word timestamps for drill renderer */
+        EnterCriticalSection(&g_tts_current_ts_lock);
+        free(g_tts_current_ts.words);
+        g_tts_current_ts = worker_ts;
+        LeaveCriticalSection(&g_tts_current_ts_lock);
 
         /* Parse WAV header */
         const int16_t *pcm = NULL;
@@ -854,12 +1216,7 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
 
 static int tts_worker_start(void) {
     InitializeCriticalSection(&g_tts_lock);
-    InitializeCriticalSection(&g_tts_cache_lock);
-    for (int i = 0; i < TTS_CACHE_SIZE; i++) {
-        g_tts_cache[i].sentence_idx = -1;
-        g_tts_cache[i].wav_data = NULL;
-        g_tts_cache[i].wav_len = 0;
-    }
+    InitializeCriticalSection(&g_tts_current_ts_lock);
     g_tts_request_event = CreateEventA(NULL, FALSE, FALSE, NULL);   /* auto-reset */
     g_tts_shutdown_event = CreateEventA(NULL, TRUE, FALSE, NULL);   /* manual-reset */
     if (!g_tts_request_event || !g_tts_shutdown_event) {
@@ -908,11 +1265,64 @@ static void tts_worker_stop(void) {
     g_tts_pending_text = NULL;
     LeaveCriticalSection(&g_tts_lock);
     DeleteCriticalSection(&g_tts_lock);
-    tts_cache_clear();
-    DeleteCriticalSection(&g_tts_cache_lock);
+    EnterCriticalSection(&g_tts_current_ts_lock);
+    free(g_tts_current_ts.words);
+    g_tts_current_ts.words = NULL;
+    g_tts_current_ts.count = 0;
+    LeaveCriticalSection(&g_tts_current_ts_lock);
+    DeleteCriticalSection(&g_tts_current_ts_lock);
 }
 
-/* ---- TTS pre-fetch thread ---- */
+/* ---- TTS pre-fetch thread (continuous sweep + priority) ---- */
+
+/* Fetch one sentence's TTS+ASR and store in drill cache.
+ * Returns 1 on success, 0 on failure. */
+static int tts_prefetch_fetch_one(int idx, int voice_idx) {
+    if (idx < 0 || idx >= g_drill_state.num_sentences) return 0;
+    const char *text = g_drill_state.sentences[idx].chinese;
+    if (!text[0]) return 0;
+
+    char *wav_data = NULL;
+    int wav_len = 0;
+    TtsTimestamps ts = {0};
+
+    /* Try disk cache first */
+    if (tts_disk_cache_load(g_tts_voices[voice_idx], text, &wav_data, &wav_len, &ts)) {
+        tts_drill_cache_put(idx, wav_data, wav_len, &ts);
+        free(ts.words);
+        InterlockedIncrement(&g_tts_prefetch_done);
+        char pmsg[80];
+        snprintf(pmsg, sizeof(pmsg), "Loaded from disk cache: sentence %d (%ld/%ld)",
+                 idx,
+                 InterlockedCompareExchange(&g_tts_prefetch_done, 0, 0),
+                 InterlockedCompareExchange(&g_tts_prefetch_total, 0, 0));
+        log_event("TTS_PRE", pmsg);
+        return 1;
+    }
+
+    int rc = tts_request(text, g_tts_voices[voice_idx], &wav_data, &wav_len,
+                         &ts, &g_tts_prefetch_hrequest);
+    if (rc != 0 || !wav_data) {
+        free(wav_data);
+        free(ts.words);
+        return 0;
+    }
+
+    /* Save to disk before put (put takes ownership of wav_data) */
+    tts_disk_cache_save(g_tts_voices[voice_idx], text, wav_data, wav_len, &ts);
+
+    tts_drill_cache_put(idx, wav_data, wav_len, &ts);
+    free(ts.words);
+    InterlockedIncrement(&g_tts_prefetch_done);
+
+    char pmsg[80];
+    snprintf(pmsg, sizeof(pmsg), "Prefetched sentence %d (%ld/%ld)",
+             idx,
+             InterlockedCompareExchange(&g_tts_prefetch_done, 0, 0),
+             InterlockedCompareExchange(&g_tts_prefetch_total, 0, 0));
+    log_event("TTS_PRE", pmsg);
+    return 1;
+}
 
 static DWORD WINAPI tts_prefetch_proc(LPVOID param) {
     (void)param;
@@ -922,82 +1332,58 @@ static DWORD WINAPI tts_prefetch_proc(LPVOID param) {
         DWORD which = WaitForMultipleObjects(2, events, FALSE, INFINITE);
         if (which != WAIT_OBJECT_0) break; /* shutdown */
 
-        /* Snapshot targets under lock */
-        int targets[TTS_CACHE_SIZE];
-        int voice_idx;
-        EnterCriticalSection(&g_tts_prefetch_lock);
-        for (int i = 0; i < TTS_CACHE_SIZE; i++)
-            targets[i] = g_tts_prefetch_targets[i];
-        voice_idx = g_tts_prefetch_voice_idx;
-        LeaveCriticalSection(&g_tts_prefetch_lock);
+        LONG voice_gen = InterlockedCompareExchange(&g_tts_prefetch_voice_gen, 0, 0);
+        int voice_idx = g_tts_drill_cache_voice;
+        int n = g_tts_drill_cache_count;
 
-        /* Reset cancel flag */
-        InterlockedExchange(&g_tts_prefetch_cancel, 0);
+        /* Count already-cached entries to init done counter */
+        LONG already = 0;
+        for (int i = 0; i < n; i++) {
+            if (tts_drill_cache_has(i)) already++;
+        }
+        InterlockedExchange(&g_tts_prefetch_done, already);
+        InterlockedExchange(&g_tts_prefetch_total, (LONG)n);
 
-        for (int i = 0; i < TTS_CACHE_SIZE; i++) {
-            if (targets[i] < 0) continue;
+        /* Sequential sweep 0..N with priority interrupts */
+        for (int i = 0; i < n; i++) {
+            /* Check shutdown */
+            if (WaitForSingleObject(g_tts_prefetch_shutdown, 0) == WAIT_OBJECT_0)
+                goto done;
 
-            /* Check if cancelled */
-            if (InterlockedCompareExchange(&g_tts_prefetch_cancel, 0, 0))
-                break;
+            /* Check voice generation change — restart sweep */
+            LONG cur_gen = InterlockedCompareExchange(&g_tts_prefetch_voice_gen, 0, 0);
+            if (cur_gen != voice_gen) break; /* outer loop will re-wait on event */
 
-            /* Already cached? */
-            if (tts_cache_has(targets[i], voice_idx))
-                continue;
-
-            /* Fetch from server */
-            const char *text = g_drill_state.sentences[targets[i]].chinese;
-            if (!text[0]) continue;
-
-            char *wav_data = NULL;
-            int wav_len = 0;
-            int rc = tts_request(text, g_tts_voices[voice_idx], &wav_data, &wav_len,
-                                 &g_tts_prefetch_hrequest);
-
-            if (rc != 0 || !wav_data) {
-                free(wav_data);
-                break;  /* Server failure: stop, wait for next signal */
-            }
-
-            /* Check cancel + re-validate targets after HTTP call */
-            if (InterlockedCompareExchange(&g_tts_prefetch_cancel, 0, 0)) {
-                free(wav_data);
-                break;
-            }
-
-            /* Re-check that this target is still desired */
-            int still_wanted = 0;
-            EnterCriticalSection(&g_tts_prefetch_lock);
-            if (g_tts_prefetch_voice_idx == voice_idx) {
-                for (int j = 0; j < TTS_CACHE_SIZE; j++) {
-                    if (g_tts_prefetch_targets[j] == targets[i]) {
-                        still_wanted = 1;
-                        break;
-                    }
+            /* Check priority: service it first, then resume */
+            LONG pri = InterlockedExchange(&g_tts_prefetch_priority, -1);
+            if (pri >= 0 && pri < n && !tts_drill_cache_has((int)pri)) {
+                if (!tts_prefetch_fetch_one((int)pri, voice_idx)) {
+                    if (WaitForSingleObject(g_tts_prefetch_shutdown, 2000) == WAIT_OBJECT_0)
+                        goto done;
                 }
             }
-            LeaveCriticalSection(&g_tts_prefetch_lock);
 
-            if (still_wanted) {
-                char pmsg[80];
-                snprintf(pmsg, sizeof(pmsg), "Prefetched sentence %d", targets[i]);
-                log_event("TTS_PRE", pmsg);
-                tts_cache_put(targets[i], voice_idx, wav_data, wav_len);
-            } else {
-                free(wav_data);
+            /* Skip already-cached */
+            if (tts_drill_cache_has(i)) continue;
+
+            /* Fetch this sentence */
+            if (!tts_prefetch_fetch_one(i, voice_idx)) {
+                /* Server failure: backoff and retry this index */
+                if (WaitForSingleObject(g_tts_prefetch_shutdown, 2000) == WAIT_OBJECT_0)
+                    goto done;
+                i--;  /* will be incremented by for loop */
+                continue;
             }
         }
+        /* Sweep complete — wait for next event (voice change) */
     }
 
+done:
     return 0;
 }
 
 static void tts_prefetch_start(void) {
-    InitializeCriticalSection(&g_tts_prefetch_lock);
-    for (int i = 0; i < TTS_CACHE_SIZE; i++)
-        g_tts_prefetch_targets[i] = -1;
-    g_tts_prefetch_voice_idx = g_tts_voice_idx;
-    InterlockedExchange(&g_tts_prefetch_cancel, 0);
+    InterlockedExchange(&g_tts_prefetch_priority, -1);
 
     g_tts_prefetch_event = CreateEventA(NULL, FALSE, FALSE, NULL);     /* auto-reset */
     g_tts_prefetch_shutdown = CreateEventA(NULL, TRUE, FALSE, NULL);   /* manual-reset */
@@ -1012,11 +1398,15 @@ static void tts_prefetch_start(void) {
         return;
     }
 
+    /* Kick off initial sweep */
+    InterlockedExchange(&g_tts_prefetch_total, (LONG)g_tts_drill_cache_count);
+    InterlockedExchange(&g_tts_prefetch_done, 0);
+    SetEvent(g_tts_prefetch_event);
+
     log_event("TTS_PRE", "Prefetch thread started");
 }
 
 static void tts_prefetch_stop(void) {
-    InterlockedExchange(&g_tts_prefetch_cancel, 1);
     /* Cancel any in-flight HTTP request so thread unblocks immediately */
     {
         HINTERNET h = InterlockedExchangePointer(
@@ -1038,44 +1428,28 @@ static void tts_prefetch_stop(void) {
         CloseHandle(g_tts_prefetch_shutdown);
         g_tts_prefetch_shutdown = NULL;
     }
-    /* Cache is owned by tts_worker lifetime (cleared in tts_worker_stop) */
-    DeleteCriticalSection(&g_tts_prefetch_lock);
 }
 
-/* Update prefetch targets: current sentence + predicted next 2.
- * Call after drill_advance, voice change, or HSK filter change. */
-static void tts_prefetch_update(int current_sentence_idx) {
-    int targets[TTS_CACHE_SIZE];
-    targets[0] = current_sentence_idx;
-
-    /* Predict next 2 using deterministic peek */
-    int next[2] = { -1, -1 };
-    int n = drill_peek_next(&g_drill_state, current_sentence_idx, next, 2);
-    targets[1] = (n >= 1) ? next[0] : -1;
-    targets[2] = (n >= 2) ? next[1] : -1;
-
-    int voice = g_tts_voice_idx;
-
-    /* Cancel in-flight prefetch: flag + abort HTTP immediately */
-    InterlockedExchange(&g_tts_prefetch_cancel, 1);
-    {
-        HINTERNET h = InterlockedExchangePointer(
-            (volatile PVOID *)&g_tts_prefetch_hrequest, NULL);
-        if (h) WinHttpCloseHandle(h);
-    }
-
-    tts_cache_evict_stale(voice, targets, TTS_CACHE_SIZE);
-
-    /* Update targets under lock */
-    EnterCriticalSection(&g_tts_prefetch_lock);
-    for (int i = 0; i < TTS_CACHE_SIZE; i++)
-        g_tts_prefetch_targets[i] = targets[i];
-    g_tts_prefetch_voice_idx = voice;
-    LeaveCriticalSection(&g_tts_prefetch_lock);
-
-    /* Signal prefetch thread */
+/* Set priority sentence and wake prefetch thread. */
+static void tts_prefetch_prioritize(int idx) {
+    InterlockedExchange(&g_tts_prefetch_priority, (LONG)idx);
     if (g_tts_prefetch_event)
         SetEvent(g_tts_prefetch_event);
+}
+
+/* Publish cached timestamps to g_tts_current_ts for drill renderer. */
+static void tts_publish_cached_timestamps(int idx) {
+    TtsTimestamps ts = {0};
+    int have = tts_drill_cache_copy_ts(idx, &ts);
+    EnterCriticalSection(&g_tts_current_ts_lock);
+    free(g_tts_current_ts.words);
+    if (have) {
+        g_tts_current_ts = ts;
+    } else {
+        g_tts_current_ts.words = NULL;
+        g_tts_current_ts.count = 0;
+    }
+    LeaveCriticalSection(&g_tts_current_ts_lock);
 }
 
 /* Queue text for server TTS playback (non-blocking).
@@ -3405,6 +3779,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 InvalidateRect(g_hwnd_stats, NULL, FALSE);
                 if (g_hwnd_diag)
                     InvalidateRect(g_hwnd_diag, NULL, FALSE);
+                /* Refresh drill panel while prefetch is still running */
+                if (g_hwnd_drill && g_drill_mode) {
+                    LONG pf_done  = InterlockedCompareExchange(&g_tts_prefetch_done, 0, 0);
+                    LONG pf_total = InterlockedCompareExchange(&g_tts_prefetch_total, 0, 0);
+                    if (pf_total > 0 && pf_done < pf_total)
+                        InvalidateRect(g_hwnd_drill, NULL, FALSE);
+                }
             }
             else if (wParam == ID_TIMER_DRILL_FLASH) {
                 KillTimer(g_hwnd_main, ID_TIMER_DRILL_FLASH);
@@ -3415,6 +3796,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 KillTimer(g_hwnd_main, ID_TIMER_DRILL_COPY);
                 g_drill_copy_row = -1;
                 if (g_hwnd_drill)
+                    InvalidateRect(g_hwnd_drill, NULL, FALSE);
+            }
+            else if (wParam == ID_TIMER_PLAYBACK) {
+                if (g_drill_mode && g_hwnd_drill)
                     InvalidateRect(g_hwnd_drill, NULL, FALSE);
             }
             return 0;
@@ -3854,6 +4239,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_TTS_STATUS: {
             g_tts_state = (int)wParam;
+            /* Playback highlight timer: repaint drill panel at 50ms while speaking */
+            if ((int)wParam == 2 && g_drill_mode) {
+                SetTimer(g_hwnd_main, ID_TIMER_PLAYBACK, 50, NULL);
+            } else {
+                KillTimer(g_hwnd_main, ID_TIMER_PLAYBACK);
+            }
             /* Update label to show TTS state with correct mode prefix */
             const char *prefix = g_drill_mode ? "Drill"
                                : g_tutor_mode ? "Tutor"
@@ -3892,6 +4283,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_DESTROY:
             KillTimer(hwnd, ID_TIMER_DEVSTATUS);
+            KillTimer(hwnd, ID_TIMER_PLAYBACK);
             if (g_is_recording) {
                 stop_recording();
             }
@@ -4158,6 +4550,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Start TTS worker thread (server-based) */
     tts_worker_start();
 
+    /* Pre-load drill sentence bank and start background TTS+ASR prefetch */
+    if (drill_load_bank(&g_drill_state, g_drill_sentence_path) == 0) {
+        char bmsg[80];
+        snprintf(bmsg, sizeof(bmsg), "Loaded %d sentences", g_drill_state.num_sentences);
+        log_event("DRILL", bmsg);
+        tts_drill_cache_init(g_drill_state.num_sentences);
+        g_tts_drill_cache_voice = g_tts_voice_idx;
+        tts_prefetch_start();
+    }
+
     /* Start named pipe server thread */
     g_pipe_shutdown_event = CreateEventA(NULL, TRUE, FALSE, NULL);  /* manual reset */
     g_pipe_running = 1;
@@ -4186,7 +4588,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             if (g_drill_mode && g_drill_state.has_result
                 && g_drill_state.last_diff.match && !g_is_recording) {
                 drill_advance(&g_drill_state);
-                tts_prefetch_update(g_drill_state.current_idx);
+                tts_prefetch_prioritize(g_drill_state.current_idx);
+                tts_publish_cached_timestamps(g_drill_state.current_idx);
                 g_drill_stream_len = 0;
                 if (g_hwnd_drill)
                     InvalidateRect(g_hwnd_drill, NULL, FALSE);
@@ -4243,10 +4646,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             }
             log_event("TTS", g_tts_voices[g_tts_voice_idx]);
             InvalidateRect(g_hwnd_stats, NULL, FALSE);
-            if (g_drill_mode) {
-                InvalidateRect(g_hwnd_drill, NULL, FALSE);
-                tts_prefetch_update(g_drill_state.current_idx);
+            /* Clear prefetch cache and restart with new voice */
+            {
+                HINTERNET h = InterlockedExchangePointer(
+                    (volatile PVOID *)&g_tts_prefetch_hrequest, NULL);
+                if (h) WinHttpCloseHandle(h);
             }
+            tts_drill_cache_clear();
+            g_tts_drill_cache_voice = g_tts_voice_idx;
+            InterlockedIncrement(&g_tts_prefetch_voice_gen);
+            InterlockedExchange(&g_tts_prefetch_done, 0);
+            if (g_drill_mode) {
+                tts_prefetch_prioritize(g_drill_state.current_idx);
+                InvalidateRect(g_hwnd_drill, NULL, FALSE);
+            }
+            if (g_tts_prefetch_event) SetEvent(g_tts_prefetch_event);
             continue;
         }
         /* L key: in drill mode, speak target sentence via server TTS (ignore auto-repeat) */
@@ -4347,24 +4761,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 log_event("DRILL", "Entering Pronunciation Drill mode");
                 g_asr_language = "Chinese";
 
-                if (drill_init(&g_drill_state, g_drill_sentence_path,
-                               g_drill_progress_path) != 0) {
-                    log_event("DRILL", "Failed to load sentences — cancelling");
+                if (g_drill_state.num_sentences <= 0) {
+                    log_event("DRILL", "No sentences loaded — cancelling");
                     g_drill_mode = 0;
                     InvalidateRect(g_hwnd_stats, NULL, FALSE);
                     continue;
                 }
-                srand((unsigned int)GetTickCount());
+                drill_init_game(&g_drill_state, g_drill_progress_path);
+                srand(42);
                 drill_advance(&g_drill_state);
                 g_drill_stream_len = 0;
-                tts_prefetch_start();
-                tts_prefetch_update(g_drill_state.current_idx);
+                tts_prefetch_prioritize(g_drill_state.current_idx);
+                tts_publish_cached_timestamps(g_drill_state.current_idx);
 
                 SetWindowTextA(g_hwnd_lbl_claude, "Drill:");
                 log_event("DRILL", "Pronunciation Drill active");
             } else {
                 log_event("DRILL", "Exiting Pronunciation Drill mode");
-                tts_prefetch_stop();
                 drill_shutdown(&g_drill_state, g_drill_progress_path);
 
                 /* Restore language based on tutor mode */
@@ -4398,7 +4811,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                      g_drill_state.hsk_filter == 2 ? "HSK 2" : "HSK 3");
             log_event("DRILL", hmsg);
             drill_advance(&g_drill_state);
-            tts_prefetch_update(g_drill_state.current_idx);
+            tts_prefetch_prioritize(g_drill_state.current_idx);
+            tts_publish_cached_timestamps(g_drill_state.current_idx);
             g_drill_stream_len = 0;
             if (g_hwnd_drill)
                 InvalidateRect(g_hwnd_drill, NULL, FALSE);
@@ -4413,10 +4827,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         fclose(g_log_file);
     }
     /* ASR model cleanup not needed -- transcription via HTTP server */
+    tts_prefetch_stop();
     if (g_drill_mode) {
-        tts_prefetch_stop();
         drill_shutdown(&g_drill_state, g_drill_progress_path);
     }
+    tts_drill_cache_destroy();
     DeleteObject(g_font_large);
     DeleteObject(g_font_medium);
     DeleteObject(g_font_normal);
