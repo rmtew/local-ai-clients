@@ -490,23 +490,6 @@ static void waveout_close(void) {
 static int waveout_play_pcm(const int16_t *samples, int n_samples) {
     if (!g_waveout || n_samples <= 0) return 0;
 
-    /* Prime the audio pipeline with a tiny silent buffer to avoid cold-start
-     * speed-up artifacts (Windows audio mixer can play the first buffer fast
-     * to "catch up" when opening a non-native sample rate like 24000 Hz). */
-    {
-        int16_t silence[480] = {0};  /* 20ms at 24kHz */
-        WAVEHDR primer = {0};
-        primer.lpData = (LPSTR)silence;
-        primer.dwBufferLength = sizeof(silence);
-        if (waveOutPrepareHeader(g_waveout, &primer, sizeof(primer)) == MMSYSERR_NOERROR) {
-            ResetEvent(g_waveout_done_event);
-            if (waveOutWrite(g_waveout, &primer, sizeof(primer)) == MMSYSERR_NOERROR) {
-                WaitForSingleObject(g_waveout_done_event, 200);
-            }
-            waveOutUnprepareHeader(g_waveout, &primer, sizeof(primer));
-        }
-    }
-
     /* Submit entire buffer as one WAVEHDR */
     int interrupted = 0;
     WAVEHDR hdr = {0};
