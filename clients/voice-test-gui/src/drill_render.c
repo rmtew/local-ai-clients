@@ -57,6 +57,15 @@
 static int s_target_y_top = 0, s_target_y_bot = 0;
 static int s_result_y_top = 0, s_result_y_bot = 0;
 
+/* Copy icon hit rect (set during WM_PAINT) */
+static RECT s_copy_icon_rc = {0};
+
+/* Layout statics for word-click playback (set during WM_PAINT, read by WM_LBUTTONUP) */
+static int s_char_x[DRILL_MAX_TEXT];
+static int s_group_of[DRILL_MAX_TEXT];
+static int s_grp_start_ms[DRILL_MAX_TEXT], s_grp_end_ms[DRILL_MAX_TEXT];
+static int s_cell_w, s_num_target, s_n_groups;
+
 /* Copy UTF-8 string to clipboard as Unicode */
 static void drill_copy_to_clipboard(HWND hwnd, const char *utf8)
 {
@@ -181,19 +190,36 @@ static int map_chars_to_word_groups(const int *cps, int n_cps,
 }
 
 /* Compute per-character X positions with word group gaps.
- * char_x[i] = left X of cell i. Returns total width. */
+ * char_x[i] = left X of cell i. Returns total width.
+ * group_min_w (optional): per-group minimum span widths (e.g. from pinyin measurement).
+ * Characters are centered within widened groups. */
 static int compute_char_positions(int n, int cell_w, const int *group_of,
-                                   int n_groups, int *char_x)
+                                   int n_groups, const int *group_min_w,
+                                   int *char_x)
 {
     int x = 0;
-    for (int i = 0; i < n; i++) {
-        if (i > 0 && n_groups > 0 && group_of[i] != group_of[i - 1]) {
-            x += WORD_GAP_PX;
+    int i = 0;
+    while (i < n) {
+        int g = group_of[i];
+        int g_start = i;
+        while (i < n && group_of[i] == g) i++;
+        int n_in_grp = i - g_start;
+
+        if (g_start > 0 && n_groups > 0) x += WORD_GAP_PX;
+
+        /* Group span: max of chars*cell_w and pinyin width */
+        int char_span = n_in_grp * cell_w;
+        int min_w = (group_min_w && g >= 0 && g < n_groups) ? group_min_w[g] : 0;
+        int grp_span = (min_w > char_span) ? min_w : char_span;
+
+        /* Center characters within potentially wider group span */
+        int pad = (grp_span - char_span) / 2;
+        for (int j = 0; j < n_in_grp; j++) {
+            char_x[g_start + j] = x + pad + j * cell_w;
         }
-        char_x[i] = x;
-        x += cell_w;
+        x += grp_span;
     }
-    return x; /* total width */
+    return x;
 }
 
 /* Color for a timing delta (ms between consecutive chars) */
@@ -383,6 +409,47 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                                  &ts_snap, group_of,
                                                  grp_start, grp_end);
 
+        /* Split pinyin into syllables + measure per-group widths for layout */
+        char pin_copy[512] = "";
+        char *pin_syllables[DRILL_MAX_TEXT];
+        int n_pin_syl = 0;
+        int group_pin_w[DRILL_MAX_TEXT] = {0};
+        if (n_groups > 0) {
+            strncpy(pin_copy, sent->pinyin, sizeof(pin_copy) - 1);
+            {
+                char *p = pin_copy;
+                while (*p && n_pin_syl < DRILL_MAX_TEXT) {
+                    while (*p == ' ') p++;
+                    if (!*p) break;
+                    pin_syllables[n_pin_syl++] = p;
+                    while (*p && *p != ' ') p++;
+                    if (*p) *p++ = '\0';
+                }
+            }
+            /* Measure each group's pinyin in the medium font */
+            SelectObject(hdc, g_font_medium);
+            for (int g = 0; g < n_groups; g++) {
+                char grp_pin[256] = "";
+                int pos = 0;
+                for (int ci = 0; ci < num_target && ci < n_pin_syl; ci++) {
+                    if (group_of[ci] != g) continue;
+                    if (pos > 0 && pos < (int)sizeof(grp_pin) - 1)
+                        grp_pin[pos++] = ' ';
+                    int len = (int)strlen(pin_syllables[ci]);
+                    if (pos + len < (int)sizeof(grp_pin) - 1) {
+                        memcpy(grp_pin + pos, pin_syllables[ci], len);
+                        pos += len;
+                    }
+                }
+                if (pos > 0) {
+                    SIZE sz;
+                    GetTextExtentPoint32A(hdc, grp_pin, pos, &sz);
+                    group_pin_w[g] = sz.cx + 8;
+                }
+            }
+            SelectObject(hdc, g_font_drill_chinese); /* restore */
+        }
+
         /* Determine how many cells (target + possible excess from result) */
         int num_result_extra = 0;
         if (g_drill_state.has_result && diff->num_actual > num_target)
@@ -399,12 +466,25 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         /* Compute per-character X positions with word group gaps */
         int char_x[DRILL_MAX_TEXT];
         int total_w = compute_char_positions(total_cols, cell_w, group_of,
-                                              n_groups, char_x);
+                                              n_groups, group_pin_w, char_x);
         int start_x = (w - total_w) / 2;
         if (start_x < margin) start_x = margin;
 
         /* Offset all char_x by start_x */
         for (int i = 0; i < total_cols; i++) char_x[i] += start_x;
+
+        /* Save layout statics for WM_LBUTTONUP word-click */
+        s_cell_w = cell_w;
+        s_num_target = num_target;
+        s_n_groups = n_groups;
+        for (int i = 0; i < total_cols; i++) {
+            s_char_x[i] = char_x[i];
+            s_group_of[i] = group_of[i];
+        }
+        for (int i = 0; i < n_groups; i++) {
+            s_grp_start_ms[i] = grp_start[i];
+            s_grp_end_ms[i] = grp_end[i];
+        }
 
         /* Row 1: Target characters (large font, white) */
         s_target_y_top = y;
@@ -425,6 +505,20 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 DeleteObject(pen);
             }
         }
+
+        /* Copy icon at right edge of target row (U+29C9 TWO JOINED SQUARES) */
+        {
+            int icon_x = w - margin - cell_w;
+            s_copy_icon_rc.left = icon_x;
+            s_copy_icon_rc.top = y;
+            s_copy_icon_rc.right = icon_x + cell_w;
+            s_copy_icon_rc.bottom = y + cell_h;
+            SelectObject(hdc, g_font_drill_chinese);
+            SetTextColor(hdc, RGB(140, 140, 160));
+            DrawTextW(hdc, L"\x29C9", 1, &s_copy_icon_rc,
+                      DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
+
         y += cell_h + 2;
         s_target_y_bot = y;
 
@@ -577,13 +671,66 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                      char_x, cell_w, y, w);
         }
 
-        /* Pinyin */
+        /* Pinyin — grouped by word boundaries when timestamps available */
         {
             SelectObject(hdc, g_font_medium);
             SetTextColor(hdc, DRILL_COLOR_PINYIN);
-            RECT pin_rc = { margin, y, w - margin, y + 24 };
-            DrawTextA(hdc, sent->pinyin, -1, &pin_rc,
-                      DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+            if (n_groups > 0 && n_pin_syl > 0) {
+                for (int g = 0; g < n_groups; g++) {
+                    int first = -1, last = -1;
+                    for (int i = 0; i < num_target; i++) {
+                        if (group_of[i] == g) {
+                            if (first < 0) first = i;
+                            last = i;
+                        }
+                    }
+                    if (first < 0) continue;
+
+                    /* Build group pinyin string */
+                    char grp_pin[256] = "";
+                    int pos = 0;
+                    for (int i = first; i <= last && i < n_pin_syl; i++) {
+                        if (pos > 0 && pos < (int)sizeof(grp_pin) - 1)
+                            grp_pin[pos++] = ' ';
+                        int len = (int)strlen(pin_syllables[i]);
+                        if (pos + len < (int)sizeof(grp_pin) - 1) {
+                            memcpy(grp_pin + pos, pin_syllables[i], len);
+                            pos += len;
+                        }
+                    }
+                    grp_pin[pos] = '\0';
+
+                    /* Use full group span (chars may be centered in wider span) */
+                    int char_left = char_x[first];
+                    int char_right = char_x[last] + cell_w;
+                    int center = (char_left + char_right) / 2;
+                    int char_w = char_right - char_left;
+                    int pin_w = group_pin_w[g];
+                    int full_w = (pin_w > char_w) ? pin_w : char_w;
+                    int gx_left = center - full_w / 2;
+                    int gx_right = center + (full_w + 1) / 2;
+                    RECT grp_rc = { gx_left, y, gx_right, y + 24 };
+                    DrawTextA(hdc, grp_pin, -1, &grp_rc,
+                              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+                    /* Separator line between groups */
+                    if (g > 0 && first > 0) {
+                        int sep_x = (char_x[first - 1] + cell_w + gx_left) / 2;
+                        HPEN pen = CreatePen(PS_SOLID, 1, RGB(80, 85, 100));
+                        HPEN old_pen = (HPEN)SelectObject(hdc, pen);
+                        MoveToEx(hdc, sep_x, y + 4, NULL);
+                        LineTo(hdc, sep_x, y + 20);
+                        SelectObject(hdc, old_pen);
+                        DeleteObject(pen);
+                    }
+                }
+            } else {
+                /* Fallback: single centered line */
+                RECT pin_rc = { margin, y, w - margin, y + 24 };
+                DrawTextA(hdc, sent->pinyin, -1, &pin_rc,
+                          DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
             y += 26;
         }
 
@@ -692,6 +839,7 @@ paint_done:
         return 1;
 
     case WM_LBUTTONUP: {
+        int click_x = LOWORD(lParam);
         int click_y = HIWORD(lParam);
         if (g_drill_state.current_idx < 0 ||
             g_drill_state.current_idx >= g_drill_state.num_sentences)
@@ -699,14 +847,39 @@ paint_done:
 
         DrillSentence *s = &g_drill_state.sentences[g_drill_state.current_idx];
 
-        if (click_y >= s_target_y_top && click_y < s_target_y_bot) {
-            /* Click on target row: copy original Chinese */
+        /* Copy icon click */
+        if (click_x >= s_copy_icon_rc.left && click_x < s_copy_icon_rc.right
+            && click_y >= s_copy_icon_rc.top && click_y < s_copy_icon_rc.bottom) {
             drill_copy_to_clipboard(hwnd, s->chinese);
             log_event("DRILL", "Copied target Chinese to clipboard");
             g_drill_copy_row = 0;
             g_drill_copy_tick = GetTickCount();
             SetTimer(g_hwnd_main, ID_TIMER_DRILL_COPY, DRILL_COPY_FLASH_MS, NULL);
             InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+
+        if (click_y >= s_target_y_top && click_y < s_target_y_bot) {
+            /* Click on target row character: play that word's audio slice */
+            if (s_num_target > 0 && s_n_groups > 0 && s_cell_w > 0) {
+                int ci = -1;
+                for (int i = 0; i < s_num_target; i++) {
+                    if (click_x >= s_char_x[i] && click_x < s_char_x[i] + s_cell_w) {
+                        ci = i;
+                        break;
+                    }
+                }
+                if (ci >= 0) {
+                    int g = s_group_of[ci];
+                    if (g >= 0 && g < s_n_groups) {
+                        /* Extend first group to include lead-in silence,
+                         * last group to include trail-off to end of WAV */
+                        int s = (g == 0) ? 0 : s_grp_start_ms[g];
+                        int e = (g == s_n_groups - 1) ? -1 : s_grp_end_ms[g];
+                        tts_play_word_slice(s, e);
+                    }
+                }
+            }
         }
         else if (click_y >= s_result_y_top && click_y < s_result_y_bot) {
             /* Click on result row: copy transcription */
