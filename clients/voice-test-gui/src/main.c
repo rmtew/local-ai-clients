@@ -104,6 +104,7 @@ DEFINE_GUID(IID_ISpVoice, 0x6C44DF74, 0x72B9, 0x4992,
 #define WM_LLM_RESPONSE  (WM_USER + 102)
 #define WM_TRANSCRIBE_DONE (WM_USER + 103)  /* lParam: AsrResult* */
 #define WM_ASR_TOKEN       (WM_USER + 104)  /* lParam: AsrTokenMsg* */
+#define WM_TTS_CACHED      (WM_USER + 105)  /* wParam: sentence idx that was cached */
 #define PIPE_BUF_SIZE 4096
 
 /* Local LLM server */
@@ -488,6 +489,23 @@ static void waveout_close(void) {
 /* Play int16 PCM samples through waveOut. Returns 0 = played fully, 1 = interrupted. */
 static int waveout_play_pcm(const int16_t *samples, int n_samples) {
     if (!g_waveout || n_samples <= 0) return 0;
+
+    /* Prime the audio pipeline with a tiny silent buffer to avoid cold-start
+     * speed-up artifacts (Windows audio mixer can play the first buffer fast
+     * to "catch up" when opening a non-native sample rate like 24000 Hz). */
+    {
+        int16_t silence[480] = {0};  /* 20ms at 24kHz */
+        WAVEHDR primer = {0};
+        primer.lpData = (LPSTR)silence;
+        primer.dwBufferLength = sizeof(silence);
+        if (waveOutPrepareHeader(g_waveout, &primer, sizeof(primer)) == MMSYSERR_NOERROR) {
+            ResetEvent(g_waveout_done_event);
+            if (waveOutWrite(g_waveout, &primer, sizeof(primer)) == MMSYSERR_NOERROR) {
+                WaitForSingleObject(g_waveout_done_event, 200);
+            }
+            waveOutUnprepareHeader(g_waveout, &primer, sizeof(primer));
+        }
+    }
 
     /* Submit entire buffer as one WAVEHDR */
     int interrupted = 0;
@@ -1166,10 +1184,17 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
                 continue;
             }
 
-            /* Persist to disk so prefetch can load from disk instead of server */
+            /* Persist to disk and in-memory cache so repeat listens are stable */
             if (sentence_idx >= 0) {
                 tts_disk_cache_save(g_tts_voices[voice_idx], text, wav_data, wav_len,
                                     want_ts ? &worker_ts : NULL);
+                /* Put a copy into in-memory cache (put takes ownership) */
+                char *cache_copy = (char *)malloc(wav_len);
+                if (cache_copy) {
+                    memcpy(cache_copy, wav_data, wav_len);
+                    tts_drill_cache_put(sentence_idx, cache_copy, wav_len,
+                                        want_ts ? &worker_ts : NULL);
+                }
             }
             free(text);
         }
@@ -1297,6 +1322,7 @@ static int tts_prefetch_fetch_one(int idx, int voice_idx) {
                  InterlockedCompareExchange(&g_tts_prefetch_done, 0, 0),
                  InterlockedCompareExchange(&g_tts_prefetch_total, 0, 0));
         log_event("TTS_PRE", pmsg);
+        PostMessageA(g_hwnd_main, WM_TTS_CACHED, (WPARAM)idx, 0);
         return 1;
     }
 
@@ -1321,6 +1347,7 @@ static int tts_prefetch_fetch_one(int idx, int voice_idx) {
              InterlockedCompareExchange(&g_tts_prefetch_done, 0, 0),
              InterlockedCompareExchange(&g_tts_prefetch_total, 0, 0));
     log_event("TTS_PRE", pmsg);
+    PostMessageA(g_hwnd_main, WM_TTS_CACHED, (WPARAM)idx, 0);
     return 1;
 }
 
@@ -1361,6 +1388,9 @@ static DWORD WINAPI tts_prefetch_proc(LPVOID param) {
                     if (WaitForSingleObject(g_tts_prefetch_shutdown, 2000) == WAIT_OBJECT_0)
                         goto done;
                 }
+                /* Voice may have changed during fetch — discard stale data */
+                cur_gen = InterlockedCompareExchange(&g_tts_prefetch_voice_gen, 0, 0);
+                if (cur_gen != voice_gen) { tts_drill_cache_clear(); break; }
             }
 
             /* Skip already-cached */
@@ -1374,6 +1404,9 @@ static DWORD WINAPI tts_prefetch_proc(LPVOID param) {
                 i--;  /* will be incremented by for loop */
                 continue;
             }
+            /* Voice may have changed during fetch — discard stale data */
+            cur_gen = InterlockedCompareExchange(&g_tts_prefetch_voice_gen, 0, 0);
+            if (cur_gen != voice_gen) { tts_drill_cache_clear(); break; }
         }
         /* Sweep complete — wait for next event (voice change) */
     }
@@ -4272,6 +4305,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SetWindowTextA(g_hwnd_lbl_claude, label);
             if (g_drill_mode && g_hwnd_drill)
                 InvalidateRect(g_hwnd_drill, NULL, FALSE);
+            return 0;
+        }
+
+        case WM_TTS_CACHED: {
+            /* Prefetch completed for a sentence — if it's the current one,
+             * publish timestamps so word group separators appear immediately. */
+            int cached_idx = (int)wParam;
+            if (g_drill_mode && cached_idx == g_drill_state.current_idx) {
+                tts_publish_cached_timestamps(cached_idx);
+                if (g_hwnd_drill)
+                    InvalidateRect(g_hwnd_drill, NULL, FALSE);
+            }
             return 0;
         }
 

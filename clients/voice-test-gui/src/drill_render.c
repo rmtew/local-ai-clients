@@ -417,7 +417,7 @@ static LRESULT CALLBACK DrillWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             /* Draw subtle word boundary separator */
             if (n_groups > 0 && i > 0 && group_of[i] != group_of[i - 1]) {
                 int sep_x = (char_x[i - 1] + cell_w + char_x[i]) / 2;
-                HPEN pen = CreatePen(PS_SOLID, 1, RGB(70, 70, 80));
+                HPEN pen = CreatePen(PS_SOLID, 2, RGB(100, 110, 130));
                 HPEN old_pen = (HPEN)SelectObject(hdc, pen);
                 MoveToEx(hdc, sep_x, y + 4, NULL);
                 LineTo(hdc, sep_x, y + cell_h - 4);
