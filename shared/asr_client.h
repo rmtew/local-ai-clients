@@ -58,4 +58,24 @@ AsrResult *asr_transcribe_stream(const float *samples, int n_samples,
                                   const char *prompt, int is_final,
                                   asr_token_cb token_cb, void *userdata);
 
+/* ---- Live streaming ASR ---- */
+
+typedef struct asr_live_session asr_live_session_t;
+
+/* Start a live streaming session. Opens SSE connection to the server.
+ * token_cb fires on a reader thread for each fixed token.
+ * Returns session handle or NULL on failure. */
+asr_live_session_t *asr_live_start(int port, const char *language,
+                                    asr_token_cb token_cb, void *userdata);
+
+/* Send incremental audio to an active live session.
+ * samples: float32 mono 16kHz. Converted to s16le and POSTed.
+ * Returns 0 on success, -1 on failure. */
+int asr_live_send_audio(asr_live_session_t *s, const float *samples, int n_samples);
+
+/* Signal end of audio and wait for the done event.
+ * Returns final AsrResult (caller must asr_free_result), or NULL on error.
+ * Frees the session handle. */
+AsrResult *asr_live_stop(asr_live_session_t *s);
+
 #endif /* ASR_CLIENT_H */

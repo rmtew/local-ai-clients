@@ -55,7 +55,7 @@ if %ERRORLEVEL% NEQ 0 (
 
 REM Link
 echo Linking...
-link /nologo /DEBUG /SUBSYSTEM:WINDOWS /OUT:"%BIN_DIR%\voice-test-gui.exe" "%BUILD_DIR%\main.obj" "%BUILD_DIR%\asr_client.obj" mfplat.lib mf.lib mfreadwrite.lib mfuuid.lib ole32.lib comctl32.lib user32.lib gdi32.lib winmm.lib winhttp.lib psapi.lib advapi32.lib
+link /nologo /DEBUG /MAP:"%BIN_DIR%\voice-test-gui.map" /SUBSYSTEM:WINDOWS /OUT:"%BIN_DIR%\voice-test-gui.exe" "%BUILD_DIR%\main.obj" "%BUILD_DIR%\asr_client.obj" mfplat.lib mf.lib mfreadwrite.lib mfuuid.lib ole32.lib comctl32.lib user32.lib gdi32.lib winmm.lib winhttp.lib psapi.lib advapi32.lib dbghelp.lib
 
 if %ERRORLEVEL% EQU 0 (
     echo.

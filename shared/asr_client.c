@@ -501,3 +501,250 @@ AsrResult *asr_transcribe_stream(const float *samples, int n_samples,
 
     return result;
 }
+
+/* ========================================================================
+ * Live Streaming ASR
+ * ======================================================================== */
+
+struct asr_live_session {
+    int port;
+    asr_token_cb token_cb;
+    void *userdata;
+
+    /* SSE reader thread */
+    HANDLE reader_thread;
+    HINTERNET hSession;
+    HINTERNET hConnect;
+    HINTERNET hRequest;
+
+    /* Final result (set by reader thread) */
+    AsrResult *final_result;
+    HANDLE done_event;
+};
+
+static DWORD WINAPI live_sse_reader(LPVOID arg) {
+    asr_live_session_t *s = (asr_live_session_t *)arg;
+    fprintf(stderr, "[live_sse_reader] Started\n");
+
+    char line_buf[4096];
+    int line_pos = 0;
+
+    for (;;) {
+        DWORD avail = 0;
+        if (!WinHttpQueryDataAvailable(s->hRequest, &avail)) {
+            fprintf(stderr, "[live_sse_reader] QueryDataAvailable failed: %lu\n", GetLastError());
+            break;
+        }
+        if (avail == 0) {
+            fprintf(stderr, "[live_sse_reader] Connection closed (avail=0)\n");
+            break;
+        }
+
+        char chunk[4096];
+        DWORD to_read = avail < sizeof(chunk) ? avail : sizeof(chunk);
+        DWORD bytes_read = 0;
+        if (!WinHttpReadData(s->hRequest, chunk, to_read, &bytes_read)) break;
+        if (bytes_read == 0) break;
+
+        for (DWORD i = 0; i < bytes_read; i++) {
+            char c = chunk[i];
+            if (c == '\n') {
+                line_buf[line_pos] = '\0';
+                if (line_pos > 0 && line_buf[line_pos - 1] == '\r')
+                    line_buf[--line_pos] = '\0';
+
+                if (line_pos > 6 && memcmp(line_buf, "data: ", 6) == 0) {
+                    const char *payload = line_buf + 6;
+                    int payload_len = line_pos - 6;
+
+                    if (strstr(payload, "\"done\"")) {
+                        fprintf(stderr, "[live_sse_reader] Got done event\n");
+                        s->final_result = asr_parse_response(payload,
+                                                              payload_len, 1);
+                        goto reader_exit;
+                    } else if (s->token_cb) {
+                        char token_text[512];
+                        int ams = 0, boff = 0;
+                        if (sse_parse_token_event(payload, payload_len,
+                                                    token_text,
+                                                    sizeof(token_text),
+                                                    &ams, &boff)) {
+                            s->token_cb(token_text, ams, boff, s->userdata);
+                        }
+                    }
+                }
+                line_pos = 0;
+            } else {
+                if (line_pos < (int)sizeof(line_buf) - 1)
+                    line_buf[line_pos++] = c;
+            }
+        }
+    }
+
+reader_exit:
+    fprintf(stderr, "[live_sse_reader] Exiting, setting done_event\n");
+    SetEvent(s->done_event);
+    return 0;
+}
+
+asr_live_session_t *asr_live_start(int port, const char *language,
+                                    asr_token_cb token_cb, void *userdata) {
+    asr_live_session_t *s = (asr_live_session_t *)calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    s->port = port;
+    s->token_cb = token_cb;
+    s->userdata = userdata;
+    s->done_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+
+    s->hSession = WinHttpOpen(L"AsrClient/1.0",
+                               WINHTTP_ACCESS_TYPE_NO_PROXY,
+                               WINHTTP_NO_PROXY_NAME,
+                               WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s->hSession) goto fail;
+
+    s->hConnect = WinHttpConnect(s->hSession, L"localhost",
+                                  (INTERNET_PORT)port, 0);
+    if (!s->hConnect) goto fail;
+
+    s->hRequest = WinHttpOpenRequest(s->hConnect, L"POST",
+                                      L"/v1/audio/transcriptions/live/start",
+                                      NULL, WINHTTP_NO_REFERER,
+                                      WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!s->hRequest) goto fail;
+
+    /* No timeout on receive — SSE stream runs for the entire session */
+    WinHttpSetTimeouts(s->hRequest, 2000, 2000, 0, 0);
+
+    /* Build JSON body */
+    char body[256];
+    int body_len;
+    if (language && language[0])
+        body_len = snprintf(body, sizeof(body), "{\"language\":\"%s\"}", language);
+    else
+        body_len = snprintf(body, sizeof(body), "{}");
+
+    BOOL ok = WinHttpSendRequest(s->hRequest,
+                                  L"Content-Type: application/json",
+                                  (DWORD)-1L,
+                                  body, (DWORD)body_len, (DWORD)body_len, 0);
+    if (!ok) goto fail;
+    if (!WinHttpReceiveResponse(s->hRequest, NULL)) goto fail;
+
+    /* Check for 200 */
+    DWORD status = 0, sz = sizeof(status);
+    WinHttpQueryHeaders(s->hRequest,
+                         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, NULL);
+    fprintf(stderr, "[asr_live_start] HTTP status: %lu\n", status);
+    if (status != 200) goto fail;
+
+    /* Spawn SSE reader thread */
+    s->reader_thread = CreateThread(NULL, 0, live_sse_reader, s, 0, NULL);
+    if (!s->reader_thread) goto fail;
+
+    fprintf(stderr, "[asr_live_start] Session started OK, SSE reader spawned\n");
+    return s;
+
+fail:
+    fprintf(stderr, "[asr_live_start] FAILED (status=%lu, err=%lu)\n",
+            status, GetLastError());
+    if (s->hRequest) WinHttpCloseHandle(s->hRequest);
+    if (s->hConnect) WinHttpCloseHandle(s->hConnect);
+    if (s->hSession) WinHttpCloseHandle(s->hSession);
+    if (s->done_event) CloseHandle(s->done_event);
+    free(s);
+    return NULL;
+}
+
+int asr_live_send_audio(asr_live_session_t *s, const float *samples, int n_samples) {
+    if (!s || !samples || n_samples <= 0) {
+        fprintf(stderr, "[asr_live_send_audio] bad args: s=%p samples=%p n=%d\n",
+                (void*)s, (void*)samples, n_samples);
+        return -1;
+    }
+
+    /* Convert float32 to s16le */
+    int data_bytes = n_samples * 2;
+    unsigned char *pcm = (unsigned char *)malloc(data_bytes);
+    if (!pcm) return -1;
+    short *dst = (short *)pcm;
+    for (int i = 0; i < n_samples; i++) {
+        float v = samples[i];
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        dst[i] = (short)(v * 32767.0f);
+    }
+
+    /* POST to /live/audio */
+    HINTERNET hReq = WinHttpOpenRequest(s->hConnect, L"POST",
+                                         L"/v1/audio/transcriptions/live/audio",
+                                         NULL, WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    int ret = -1;
+    if (hReq) {
+        WinHttpSetTimeouts(hReq, 2000, 2000, 5000, 5000);
+        BOOL ok = WinHttpSendRequest(hReq,
+                                      L"Content-Type: application/octet-stream",
+                                      (DWORD)-1L,
+                                      pcm, (DWORD)data_bytes,
+                                      (DWORD)data_bytes, 0);
+        if (ok) ok = WinHttpReceiveResponse(hReq, NULL);
+        if (ok) {
+            char buf[256];
+            DWORD br = 0;
+            WinHttpReadData(hReq, buf, sizeof(buf), &br);
+            ret = 0;
+            fprintf(stderr, "[asr_live_send_audio] OK: %d samples (%d bytes)\n",
+                    n_samples, data_bytes);
+        } else {
+            fprintf(stderr, "[asr_live_send_audio] FAILED: err=%lu\n", GetLastError());
+        }
+        WinHttpCloseHandle(hReq);
+    } else {
+        fprintf(stderr, "[asr_live_send_audio] OpenRequest failed: err=%lu\n", GetLastError());
+    }
+    free(pcm);
+    return ret;
+}
+
+AsrResult *asr_live_stop(asr_live_session_t *s) {
+    if (!s) return NULL;
+    fprintf(stderr, "[asr_live_stop] Sending stop request\n");
+
+    /* POST /live/stop */
+    HINTERNET hReq = WinHttpOpenRequest(s->hConnect, L"POST",
+                                         L"/v1/audio/transcriptions/live/stop",
+                                         NULL, WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (hReq) {
+        WinHttpSetTimeouts(hReq, 2000, 2000, 5000, 5000);
+        BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS,
+                                      0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+        if (ok) WinHttpReceiveResponse(hReq, NULL);
+        char buf[256];
+        DWORD br = 0;
+        if (ok) WinHttpReadData(hReq, buf, sizeof(buf), &br);
+        WinHttpCloseHandle(hReq);
+    }
+
+    /* Wait for done event from SSE reader */
+    fprintf(stderr, "[asr_live_stop] Waiting for done event...\n");
+    DWORD wr = WaitForSingleObject(s->done_event, 30000);
+    fprintf(stderr, "[asr_live_stop] Wait returned %lu (0=signaled, 258=timeout)\n", wr);
+
+    /* Clean up reader thread */
+    if (s->reader_thread) {
+        WaitForSingleObject(s->reader_thread, 5000);
+        CloseHandle(s->reader_thread);
+    }
+
+    AsrResult *result = s->final_result;
+
+    WinHttpCloseHandle(s->hRequest);
+    WinHttpCloseHandle(s->hConnect);
+    WinHttpCloseHandle(s->hSession);
+    CloseHandle(s->done_event);
+    free(s);
+
+    return result;
+}

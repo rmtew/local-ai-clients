@@ -18,6 +18,7 @@
 
 #include <initguid.h>
 #include <windows.h>
+#include <dbghelp.h>
 #include <commctrl.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -105,6 +106,7 @@ DEFINE_GUID(IID_ISpVoice, 0x6C44DF74, 0x72B9, 0x4992,
 #define WM_TRANSCRIBE_DONE (WM_USER + 103)  /* lParam: AsrResult* */
 #define WM_ASR_TOKEN       (WM_USER + 104)  /* lParam: AsrTokenMsg* */
 #define WM_TTS_CACHED      (WM_USER + 105)  /* wParam: sentence idx whose word groupings are ready */
+#define WM_LIVE_STARTED    (WM_USER + 106)  /* lParam: asr_live_session_t* or NULL */
 #define PIPE_BUF_SIZE 4096
 
 /* Local LLM server */
@@ -153,6 +155,9 @@ static HWND g_hwnd_sysinfo = NULL;  /* system/hardware info strip */
 static HWND g_hwnd_diag = NULL;   /* full-width diagnostics strip */
 static HWND g_hwnd_drill = NULL;  /* drill mode display panel */
 static int g_drill_mode = 0;
+static int g_live_mode = 0;                     /* live streaming ASR toggle */
+static asr_live_session_t *g_live_session = NULL;
+static int g_live_last_sent = 0;                /* recording_samples index of last sent chunk */
 static HFONT g_font_drill_chinese = NULL;
 static DrillState g_drill_state;
 static char g_drill_sentence_path[MAX_PATH];
@@ -205,13 +210,6 @@ static int g_tts_voice_idx = 0;  /* Vivian default */
 static int g_tts_voice_seeds[TTS_NUM_VOICES];    /* -1 = unlocked, >=0 = locked seed */
 static volatile LONG g_tts_last_seed = -1;       /* seed from last auditioned TTS */
 
-/* Last-WAV cache: single-entry cache keyed by sentence_idx + voice_idx */
-static char            *g_tts_last_wav = NULL;
-static int              g_tts_last_wav_len = 0;
-static int              g_tts_last_wav_sentence = -1;
-static int              g_tts_last_wav_voice = -1;
-static CRITICAL_SECTION g_tts_last_wav_lock;
-
 /* TTS word timestamps (from ASR on generated audio) */
 typedef struct {
     char word[64];    /* UTF-8 word text */
@@ -223,6 +221,17 @@ typedef struct {
     TtsWordTimestamp *words;  /* malloc'd, NULL if none */
     int              count;
 } TtsTimestamps;
+
+/* Last-WAV cache: single-entry cache keyed by sentence_idx + voice_idx.
+ * Stores both the WAV data and the timestamps from that specific fetch,
+ * so replay karaoke timing matches the cached audio (not a different voice). */
+static char            *g_tts_last_wav = NULL;
+static int              g_tts_last_wav_len = 0;
+static int              g_tts_last_wav_sentence = -1;
+static int              g_tts_last_wav_voice = -1;
+static TtsWordTimestamp *g_tts_last_wav_words = NULL;
+static int              g_tts_last_wav_word_count = 0;
+static CRITICAL_SECTION g_tts_last_wav_lock;
 
 /* Per-sentence word groupings (voice-independent, never purged) */
 static TtsTimestamps   *g_tts_groupings       = NULL;  /* malloc'd [num_sentences] */
@@ -380,6 +389,62 @@ static ULONGLONG g_cpu_prev_time = 0;
 
 static LARGE_INTEGER g_freq;
 static FILE *g_log_file = NULL;
+
+/* --- Crash handler (minidump + log) --- */
+static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
+    /* Write minidump */
+    char dump_path[MAX_PATH];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(dump_path, sizeof(dump_path),
+             "voice_test_gui_%04d%02d%02d_%02d%02d%02d.dmp",
+             st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond);
+
+    HANDLE hFile = CreateFileA(dump_path, GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei;
+        mei.ThreadId = GetCurrentThreadId();
+        mei.ExceptionPointers = ep;
+        mei.ClientPointers = FALSE;
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
+                          hFile, MiniDumpWithDataSegs, &mei, NULL, NULL);
+        CloseHandle(hFile);
+    }
+
+    /* Log crash details */
+    FILE *f = g_log_file ? g_log_file : fopen("voice_test_gui_crash.log", "a");
+    if (f) {
+        EXCEPTION_RECORD *er = ep->ExceptionRecord;
+        CONTEXT *ctx = ep->ContextRecord;
+        HMODULE hMod = GetModuleHandleA(NULL);
+        uintptr_t base = (uintptr_t)hMod;
+        uintptr_t rva = (uintptr_t)er->ExceptionAddress - base;
+        fprintf(f, "\n=== CRASH ===\n");
+        fprintf(f, "Exception: 0x%08lX at 0x%p (RVA 0x%llX, base 0x%llX)\n",
+                er->ExceptionCode, er->ExceptionAddress,
+                (unsigned long long)rva, (unsigned long long)base);
+        fprintf(f, "RIP=0x%016llX RSP=0x%016llX RBP=0x%016llX\n",
+                (unsigned long long)ctx->Rip,
+                (unsigned long long)ctx->Rsp,
+                (unsigned long long)ctx->Rbp);
+        fprintf(f, "RAX=0x%016llX RBX=0x%016llX RCX=0x%016llX\n",
+                (unsigned long long)ctx->Rax,
+                (unsigned long long)ctx->Rbx,
+                (unsigned long long)ctx->Rcx);
+        fprintf(f, "RDX=0x%016llX RSI=0x%016llX RDI=0x%016llX\n",
+                (unsigned long long)ctx->Rdx,
+                (unsigned long long)ctx->Rsi,
+                (unsigned long long)ctx->Rdi);
+        fprintf(f, "Minidump: %s\n", dump_path);
+        fprintf(f, "=============\n");
+        fflush(f);
+        if (f != g_log_file) fclose(f);
+    }
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 
 static HFONT g_font_large = NULL;
 static HFONT g_font_medium = NULL;
@@ -1096,6 +1161,9 @@ static void tts_last_wav_clear(void) {
     g_tts_last_wav_len = 0;
     g_tts_last_wav_sentence = -1;
     g_tts_last_wav_voice = -1;
+    free(g_tts_last_wav_words);
+    g_tts_last_wav_words = NULL;
+    g_tts_last_wav_word_count = 0;
     LeaveCriticalSection(&g_tts_last_wav_lock);
 }
 
@@ -1134,6 +1202,15 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
             effective_seed = pending_seed;
         }
 
+        {
+            char seed_msg[120];
+            snprintf(seed_msg, sizeof(seed_msg),
+                     "voice=%s pending_seed=%d effective_seed=%d voice_seeds[%d]=%d",
+                     g_tts_voices[voice_idx], pending_seed, effective_seed,
+                     voice_idx, g_tts_voice_seeds[voice_idx]);
+            log_event("TTS_SEED", seed_msg);
+        }
+
         int want_ts = g_drill_mode;
         TtsTimestamps worker_ts = {0};
         char *wav_data = NULL;
@@ -1150,6 +1227,15 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
                 if (wav_data) {
                     memcpy(wav_data, g_tts_last_wav, g_tts_last_wav_len);
                     wav_len = g_tts_last_wav_len;
+                    /* Copy timestamps that match this exact WAV */
+                    if (g_tts_last_wav_words && g_tts_last_wav_word_count > 0) {
+                        size_t tsz = g_tts_last_wav_word_count * sizeof(TtsWordTimestamp);
+                        worker_ts.words = (TtsWordTimestamp *)malloc(tsz);
+                        if (worker_ts.words) {
+                            memcpy(worker_ts.words, g_tts_last_wav_words, tsz);
+                            worker_ts.count = g_tts_last_wav_word_count;
+                        }
+                    }
                     from_cache = 1;
                 }
             }
@@ -1157,7 +1243,6 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
             if (from_cache) {
                 log_event("TTS_SRV", "Replay from cache");
                 free(text);
-                tts_groupings_copy(sentence_idx, &worker_ts);
             }
         }
 
@@ -1204,20 +1289,37 @@ static DWORD WINAPI tts_worker_proc(LPVOID param) {
             }
             free(text);
 
-            /* Store in last-WAV cache */
+            /* Store in last-WAV cache (audio + timestamps from this fetch) */
             if (sentence_idx >= 0 && wav_data && wav_len > 0) {
                 EnterCriticalSection(&g_tts_last_wav_lock);
                 free(g_tts_last_wav);
+                free(g_tts_last_wav_words);
                 g_tts_last_wav = (char *)malloc(wav_len);
                 if (g_tts_last_wav) {
                     memcpy(g_tts_last_wav, wav_data, wav_len);
                     g_tts_last_wav_len = wav_len;
                     g_tts_last_wav_sentence = sentence_idx;
                     g_tts_last_wav_voice = voice_idx;
+                    /* Store timestamps alongside WAV */
+                    if (worker_ts.words && worker_ts.count > 0) {
+                        size_t tsz = worker_ts.count * sizeof(TtsWordTimestamp);
+                        g_tts_last_wav_words = (TtsWordTimestamp *)malloc(tsz);
+                        if (g_tts_last_wav_words) {
+                            memcpy(g_tts_last_wav_words, worker_ts.words, tsz);
+                            g_tts_last_wav_word_count = worker_ts.count;
+                        } else {
+                            g_tts_last_wav_word_count = 0;
+                        }
+                    } else {
+                        g_tts_last_wav_words = NULL;
+                        g_tts_last_wav_word_count = 0;
+                    }
                 } else {
                     g_tts_last_wav_len = 0;
                     g_tts_last_wav_sentence = -1;
                     g_tts_last_wav_voice = -1;
+                    g_tts_last_wav_words = NULL;
+                    g_tts_last_wav_word_count = 0;
                 }
                 LeaveCriticalSection(&g_tts_last_wav_lock);
             }
@@ -1326,6 +1428,9 @@ static void tts_worker_stop(void) {
     free(g_tts_last_wav);
     g_tts_last_wav = NULL;
     g_tts_last_wav_len = 0;
+    free(g_tts_last_wav_words);
+    g_tts_last_wav_words = NULL;
+    g_tts_last_wav_word_count = 0;
     LeaveCriticalSection(&g_tts_last_wav_lock);
     DeleteCriticalSection(&g_tts_last_wav_lock);
 }
@@ -2938,17 +3043,23 @@ static LRESULT CALLBACK DiagWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             int value_top = label_h + 2;
             char buf[32];
 
-            /* Col 1: PASS */
+            /* Col 1: PASS (or LIVE mode indicator) */
             RECT s1 = { 0, 1, col_width, label_h + 1 };
             SetTextColor(hdc, COLOR_TEXT_DIM);
             SelectObject(hdc, g_font_normal);
-            DrawTextA(hdc, "PASS", -1, &s1, DT_CENTER);
+            DrawTextA(hdc, g_live_mode ? "MODE" : "PASS", -1, &s1, DT_CENTER);
 
-            snprintf(buf, sizeof(buf), "%d", g_pass_count);
             RECT s1v = { 0, value_top, col_width, h - 1 };
-            SetTextColor(hdc, g_transcribing ? COLOR_WAVE_MED : COLOR_WAVE_LOW);
-            SelectObject(hdc, g_font_medium);
-            DrawTextA(hdc, buf, -1, &s1v, DT_CENTER);
+            if (g_live_mode) {
+                SetTextColor(hdc, COLOR_WAVE_MED);
+                SelectObject(hdc, g_font_medium);
+                DrawTextA(hdc, "LIVE", -1, &s1v, DT_CENTER);
+            } else {
+                snprintf(buf, sizeof(buf), "%d", g_pass_count);
+                SetTextColor(hdc, g_transcribing ? COLOR_WAVE_MED : COLOR_WAVE_LOW);
+                SelectObject(hdc, g_font_medium);
+                DrawTextA(hdc, buf, -1, &s1v, DT_CENTER);
+            }
 
             /* Col 2: RTF */
             RECT s2 = { col_width, 1, col_width * 2, label_h + 1 };
@@ -3550,8 +3661,46 @@ static void check_vad_and_transcribe(void) {
     InvalidateRect(g_hwnd_stats, NULL, FALSE);
 }
 
+/* Background thread for live session start — posts result via WM_LIVE_STARTED */
+typedef struct {
+    int port;
+    char language[64];
+    asr_token_cb token_cb;
+    void *userdata;
+} LiveStartArgs;
+
+static DWORD WINAPI live_start_thread(LPVOID param) {
+    LiveStartArgs *args = (LiveStartArgs *)param;
+    asr_live_session_t *session = asr_live_start(args->port, args->language,
+                                                  args->token_cb, args->userdata);
+    free(args);
+    PostMessageA(g_hwnd_main, WM_LIVE_STARTED, 0, (LPARAM)session);
+    return 0;
+}
+
+/* Background thread for live stop — flushes remaining audio, then stops */
+typedef struct {
+    asr_live_session_t *session;
+    float *flush_buf;
+    int flush_samples;
+} LiveStopArgs;
+
+static DWORD WINAPI live_stop_thread(LPVOID param) {
+    LiveStopArgs *args = (LiveStopArgs *)param;
+    /* Send any remaining audio */
+    if (args->flush_buf && args->flush_samples > 0) {
+        asr_live_send_audio(args->session, args->flush_buf, args->flush_samples);
+        free(args->flush_buf);
+    }
+    AsrResult *result = asr_live_stop(args->session);
+    free(args);
+    PostMessageA(g_hwnd_main, WM_TRANSCRIBE_DONE, (WPARAM)1, (LPARAM)result);
+    return 0;
+}
+
 /* Start/stop recording */
 static void start_recording(void) {
+    log_event("START", "start_recording() entered");
     /* Stop any TTS playback so it doesn't talk over the user */
     if (g_tts_voice) {
         ISpVoice_Speak(g_tts_voice, L"", SPF_ASYNC | SPF_PURGEBEFORESPEAK, NULL);
@@ -3584,7 +3733,10 @@ static void start_recording(void) {
     g_want_final = 0;
     /* Wait for any in-flight transcription thread to finish */
     if (g_transcribe_thread) {
-        WaitForSingleObject(g_transcribe_thread, 3000);
+        log_event("START", "Waiting for transcribe thread...");
+        DWORD wr = WaitForSingleObject(g_transcribe_thread, 3000);
+        if (wr == WAIT_TIMEOUT)
+            log_event("START", "WARNING: transcribe thread timed out (3s)");
         CloseHandle(g_transcribe_thread);
         g_transcribe_thread = NULL;
     }
@@ -3639,17 +3791,49 @@ static void start_recording(void) {
         g_transcript_history[i][0] = '\0';
     }
 
+    log_event("START", "Creating capture thread...");
     g_capture_running = 1;
     g_capture_thread = CreateThread(NULL, 0, capture_thread_proc, NULL, 0, NULL);
+    log_event("START", g_capture_thread ? "Capture thread OK" : "Capture thread FAILED");
 
     if (g_capture_thread) {
         g_is_recording = 1;
         SetWindowTextA(g_hwnd_btn, "Stop");
-        SetWindowTextA(g_hwnd_lbl_audio, "Audio Input:");
+        SetWindowTextA(g_hwnd_lbl_audio, g_live_mode ? "Audio Input (LIVE):" : "Audio Input:");
+        chat_append("---", g_live_mode ? "Live streaming ASR [G to toggle]"
+                                       : "Retranscription ASR [G to toggle]");
+        log_event("START", "Timers starting...");
         SetTimer(g_hwnd_main, ID_TIMER_TRANSCRIBE, 500, NULL);  /* Check VAD every 500ms */
+        log_event("START", "Timer1 OK");
         SetTimer(g_hwnd_main, ID_TIMER_WAVEFORM, WAVEFORM_UPDATE_MS, NULL);
+        log_event("START", "Timer2 OK");
         /* Hide scrollbar during recording */
         ShowWindow(g_hwnd_scrollbar, SW_HIDE);
+        log_event("START", "Scrollbar hidden");
+
+        /* Start live streaming session (async — result arrives via WM_LIVE_STARTED) */
+        if (g_live_mode) {
+            log_event("START", "Entering live start block");
+            g_live_last_sent = 0;
+            LiveStartArgs *args = (LiveStartArgs *)calloc(1, sizeof(LiveStartArgs));
+            log_event("START", args ? "calloc OK" : "calloc FAILED");
+            if (args) {
+                args->port = g_asr_port;
+                if (g_asr_language && g_asr_language[0])
+                    strncpy(args->language, g_asr_language, sizeof(args->language) - 1);
+                args->token_cb = asr_stream_token_cb;
+                log_event("START", "Spawning live_start_thread...");
+                HANDLE ht = CreateThread(NULL, 0, live_start_thread, args, 0, NULL);
+                if (ht) {
+                    CloseHandle(ht);
+                    log_event("LIVE", "Starting session (async)...");
+                } else {
+                    free(args);
+                    log_event("LIVE", "Failed to spawn start thread");
+                }
+            }
+        }
+        log_event("START", "start_recording() done");
     }
 }
 
@@ -3683,8 +3867,38 @@ static void stop_recording(void) {
         g_capture_thread = NULL;
     }
 
-    /* Final retranscription of all recorded audio */
-    if (g_recording_samples >= RETRANSCRIBE_MIN_SAMPLES) {
+    if (g_live_mode && g_live_session) {
+        /* Flush remaining audio + stop — all on background thread */
+        int delta = g_recording_samples - g_live_last_sent;
+        {
+            char lb[128];
+            snprintf(lb, sizeof(lb), "Flush: %d remaining samples (total %d, sent %d)",
+                     delta, g_recording_samples, g_live_last_sent);
+            log_event("LIVE", lb);
+        }
+        LiveStopArgs *args = (LiveStopArgs *)calloc(1, sizeof(LiveStopArgs));
+        if (args) {
+            args->session = g_live_session;
+            if (delta > 0) {
+                args->flush_buf = (float *)malloc(delta * sizeof(float));
+                if (args->flush_buf) {
+                    memcpy(args->flush_buf, g_recording_buffer + g_live_last_sent,
+                           delta * sizeof(float));
+                    args->flush_samples = delta;
+                }
+            }
+            log_event("LIVE", "Stopping session (async)...");
+            HANDLE ht = CreateThread(NULL, 0, live_stop_thread, args, 0, NULL);
+            if (ht) CloseHandle(ht);
+        }
+        g_live_session = NULL;
+    } else if (g_live_mode && !g_live_session) {
+        /* Session start still in flight — WM_LIVE_STARTED handler will clean up
+         * because g_is_recording will be 0 when it arrives */
+        log_event("LIVE", "Stop before session connected — will clean up on arrival");
+    }
+    /* Final retranscription of all recorded audio (retranscribe mode only) */
+    else if (g_recording_samples >= RETRANSCRIBE_MIN_SAMPLES) {
         log_event("STOP", "Final retranscription of all audio");
         asr_kick_retranscribe(1);
     }
@@ -3853,7 +4067,8 @@ static void tts_play_word_slice(int start_ms, int end_ms) {
     }
 
     int start_sample = (int)((double)start_ms / 1000.0 * sr);
-    int end_sample   = (int)((double)end_ms   / 1000.0 * sr);
+    int end_sample   = (end_ms < 0) ? n_samples
+                     : (int)((double)end_ms / 1000.0 * sr);
     if (start_sample < 0) start_sample = 0;
     if (end_sample > n_samples) end_sample = n_samples;
     if (start_sample >= end_sample) { free(wav_copy); return; }
@@ -4013,9 +4228,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_pending_stop = 0;
                     stop_recording();
                 }
-                /* Periodic retranscription: kick every ~3s of new audio */
-                else if (g_recording_samples - g_last_transcribe_samples
-                             >= RETRANSCRIBE_INTERVAL_SAMPLES
+                /* Live mode: send audio deltas every timer tick (~0.5s) */
+                else if (g_live_mode && g_live_session) {
+                    int delta = g_recording_samples - g_live_last_sent;
+                    if (delta >= 8000) { /* 0.5s of audio */
+                        char lb[128];
+                        snprintf(lb, sizeof(lb), "Sending %d samples (%.1fs) at offset %d",
+                                 delta, delta / 16000.0f, g_live_last_sent);
+                        log_event("LIVE", lb);
+                        int rc = asr_live_send_audio(g_live_session,
+                                             g_recording_buffer + g_live_last_sent,
+                                             delta);
+                        if (rc != 0)
+                            log_event("LIVE", "send_audio FAILED");
+                        g_live_last_sent = g_recording_samples;
+                    }
+                }
+                /* Retranscription mode: kick every ~3s of new audio */
+                else if (!g_live_mode
+                         && g_recording_samples - g_last_transcribe_samples
+                                >= RETRANSCRIBE_INTERVAL_SAMPLES
                          && g_recording_samples >= RETRANSCRIBE_MIN_SAMPLES) {
                     asr_kick_retranscribe(0);
                 }
@@ -4147,12 +4379,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                     if (g_hwnd_drill)
                         InvalidateRect(g_hwnd_drill, NULL, FALSE);
+                } else if (g_live_mode) {
+                    /* Live mode: tokens are already fixed by server rollback.
+                     * Accumulate into token_buf and show as interim [...] line. */
+                    {
+                        char lb[256];
+                        snprintf(lb, sizeof(lb), "Token: \"%s\" audio_ms=%d",
+                                 tok->text, tok->audio_ms);
+                        log_event("LIVE", lb);
+                    }
+                    int tlen = (int)strlen(tok->text);
+                    if (tlen > 0 && g_token_buf_len + tlen < (int)sizeof(g_token_buf) - 1) {
+                        memcpy(g_token_buf + g_token_buf_len, tok->text, tlen);
+                        g_token_buf_len += tlen;
+                        g_token_buf[g_token_buf_len] = '\0';
+
+                        /* Replace interim line with updated token accumulation */
+                        if (g_chat_len_before_interim >= 0) {
+                            g_chat_len = g_chat_len_before_interim;
+                            g_chat_log[g_chat_len] = '\0';
+                        }
+                        if (g_token_chat_anchor < 0)
+                            g_token_chat_anchor = g_chat_len;
+                        g_chat_len_before_interim = g_token_chat_anchor;
+                        chat_append("...", g_token_buf);
+                    }
                 } else {
                     int tlen = (int)strlen(tok->text);
                     if (tlen > 0 && g_token_buf_len + tlen < (int)sizeof(g_token_buf) - 1) {
-                        /* Record anchor before first token for rollback */
-                        if (g_token_chat_anchor < 0)
-                            g_token_chat_anchor = g_chat_len;
                         memcpy(g_token_buf + g_token_buf_len, tok->text, tlen);
                         g_token_buf_len += tlen;
                         g_token_buf[g_token_buf_len] = '\0';
@@ -4162,11 +4416,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             g_chat_len = g_chat_len_before_interim;
                             g_chat_log[g_chat_len] = '\0';
                         }
+                        /* Record anchor AFTER rollback so it captures correct position */
+                        if (g_token_chat_anchor < 0)
+                            g_token_chat_anchor = g_chat_len;
                         g_chat_len_before_interim = g_token_chat_anchor;
                         chat_append("...", g_token_buf);
                     }
                 }
                 free(tok);
+            }
+            return 0;
+        }
+
+        case WM_LIVE_STARTED: {
+            asr_live_session_t *session = (asr_live_session_t *)lParam;
+            if (!session) {
+                log_event("LIVE", "Failed to start live session (server not running?)");
+            } else if (!g_is_recording || !g_live_mode) {
+                /* Recording stopped before session connected — clean up */
+                log_event("LIVE", "Session started but recording already stopped, closing");
+                LiveStopArgs *sa = (LiveStopArgs *)calloc(1, sizeof(LiveStopArgs));
+                if (sa) {
+                    sa->session = session;
+                    HANDLE ht = CreateThread(NULL, 0, live_stop_thread, sa, 0, NULL);
+                    if (ht) CloseHandle(ht);
+                }
+            } else {
+                g_live_session = session;
+                log_event("LIVE", "Session started — timer will send audio");
             }
             return 0;
         }
@@ -4196,6 +4473,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             InvalidateRect(g_hwnd_stats, NULL, FALSE);
             if (g_hwnd_diag)
                 InvalidateRect(g_hwnd_diag, NULL, FALSE);
+
+            /* Live mode: done event = commit full text, skip stability detection */
+            if (g_live_mode && is_final) {
+                /* Remove interim [...] line */
+                if (g_chat_len_before_interim >= 0) {
+                    g_chat_len = g_chat_len_before_interim;
+                    g_chat_log[g_chat_len] = '\0';
+                    g_chat_len_before_interim = -1;
+                }
+                if (result_len > 0) {
+                    handle_transcribe_result(result);
+                    g_committed_chars += result_len;
+                    log_event("LIVE", "Session done, text committed");
+                }
+                asr_free_result(tr);
+                return 0;
+            }
 
             /* Drill mode: bypass normal stability detection */
             if (g_drill_mode && is_final && result_len > 0) {
@@ -4592,6 +4886,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Open log file */
     g_log_file = fopen("voice_test_gui.log", "a");
 
+    /* Install crash handler for minidump generation */
+    SetUnhandledExceptionFilter(crash_handler);
+
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
 
@@ -4862,8 +5159,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 InterlockedExchange(&g_tts_interrupt, 1);
                 g_ptt_held = 1;
                 g_ptt_start_tick = GetTickCount();
+                log_event("PTT", g_live_mode ? "Spacebar pressed (LIVE mode)" : "Spacebar pressed (retranscribe mode)");
                 start_recording();
-                log_event("PTT", "Spacebar pressed - recording");
+                log_event("PTT", "start_recording returned");
             }
             continue;  /* Don't pass to child controls */
         }
@@ -5046,6 +5344,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             tts_seeds_save();
             tts_last_wav_clear();
             log_event("TTS_SRV", "Ctrl+Shift+< -- unlocked seed");
+            InvalidateRect(g_hwnd_stats, NULL, FALSE);
+            continue;
+        }
+        /* G key toggles Live ASR mode (ignore auto-repeat) */
+        if (msg.message == WM_KEYDOWN && msg.wParam == 'G'
+            && !(msg.lParam & (1 << 30))
+            && !(GetKeyState(VK_CONTROL) & 0x8000)
+            && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+            if (g_is_recording) {
+                log_event("LIVE", "G key blocked during recording");
+                continue;
+            }
+            g_live_mode = !g_live_mode;
+            log_event("LIVE", g_live_mode ? "Live ASR mode ON" : "Live ASR mode OFF");
             InvalidateRect(g_hwnd_stats, NULL, FALSE);
             continue;
         }
